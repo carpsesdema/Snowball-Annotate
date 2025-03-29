@@ -1,6 +1,6 @@
 # config.py (Updated with new training settings and augmentations)
 import os
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 # --- Paths ---
 # Use os.path.join for cross-platform compatibility and os.path.abspath for clarity
 # APP_DIR: Base directory for application data (settings, models, logs, etc.)
