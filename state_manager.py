@@ -1,4 +1,4 @@
-# state_manager.py (Corrected - Includes Export Method, DS Handler Refactor, Persistent Last Run Dir, Aug Keys, No Auto Load, Trigger Enables)
+# state_manager.py (Tiering Added & Formatted)
 
 import os
 import json
@@ -7,43 +7,91 @@ import torch
 import shutil
 from PyQt6.QtCore import QObject, pyqtSignal, QThread, QTimer
 
-import config
+import config  # --- TIERING: Needed for config.TIER ---
 
-# Import TrainingPipeline and DatasetHandler
+# Import TrainingPipeline and DatasetHandler (Real or Dummy based on Tier)
 # Use a logger specific to this module scope
 logger_sm = logging.getLogger(__name__)
 
+# --- TIERING: Conditionally import REAL backend components only if PRO ---
+_TrainingPipeline = None
+_DatasetHandler = None  # DatasetHandler needed for Basic export.
+_PredictionWorker = None  # Pro
+_TrainingWorker = None  # Pro
+
+# Ensure config.TIER is set before this module is fully processed
+# Use getattr for safety in case config hasn't been fully initialized somehow
+current_tier_for_import = getattr(config, "TIER", "UNKNOWN")
+logger_sm.info(
+    f"--- StateManager: Checking Tier for Backend Component Import "
+    f"(Tier={current_tier_for_import}) ---"
+)
+
+# DatasetHandler is needed for Basic export logic as well. Assume real one always.
 try:
-    from training_pipeline import TrainingPipeline, DatasetHandler
+    from training_pipeline import DatasetHandler as _DatasetHandler
 
-    logger_sm.info("OK: training_pipeline components imported.")
-except ImportError as e:
-    logger_sm.critical(
-        f"Failed to import TrainingPipeline/DatasetHandler: {e}", exc_info=True
+    logger_sm.info("OK: Real DatasetHandler imported (needed for Basic & Pro).")
+except ImportError as e_dh:
+    logger_sm.critical(f"Failed to import REAL DatasetHandler: {e_dh}", exc_info=True)
+    # Define a minimal dummy if real fails, as export needs it.
+
+    class _DummyDatasetHandler:
+        def __init__(self):
+            self.annotations = {}
+
+        def update_annotation(self, p, d):
+            pass
+
+        def get_annotation(self, p):
+            return None
+
+        def export_for_yolo(self, paths, base_dir, class_map, split=0.2):
+            logger_sm.error("Dummy DH cannot export.")
+            return None
+
+    _DatasetHandler = _DummyDatasetHandler
+    logger_sm.warning("Using dummy DatasetHandler defined in state_manager.py")
+
+
+# Import PRO components only if PRO tier
+if current_tier_for_import == "PRO":
+    try:
+        from training_pipeline import TrainingPipeline as _TrainingPipeline
+
+        logger_sm.info("[PRO] OK: training_pipeline.TrainingPipeline imported.")
+    except ImportError as e_pipe:
+        logger_sm.error(
+            f"[PRO] Failed to import TrainingPipeline: {e_pipe}", exc_info=True
+        )
+        _TrainingPipeline = None  # Ensure it's None
+
+    try:
+        from workers import (
+            PredictionWorker as _PredictionWorker,
+            TrainingWorker as _TrainingWorker,
+        )
+
+        logger_sm.info("[PRO] OK: Worker classes imported.")
+    except ImportError as e_work:
+        logger_sm.error(f"[PRO] Could not import worker classes: {e_work}")
+        _PredictionWorker, _TrainingWorker = None, None  # Ensure None
+else:
+    logger_sm.info(
+        f"[BASIC/UNKNOWN Tier] Tier detected ({current_tier_for_import}). "
+        f"Skipping PRO backend component imports."
     )
-    # Define dummies here if import fails, for basic functionality
-    if "DatasetHandler" not in globals():
 
-        class DatasetHandler:
-            def __init__(self):
-                self.annotations = {}
 
-            def update_annotation(self, p, d):
-                pass
+# --- TIERING: Fallback to DUMMIES for PRO components if needed ---
+if _TrainingPipeline is None:
+    # Avoid re-defining if already defined above or globally
+    if "TrainingPipeline" not in globals() or globals().get("TrainingPipeline") is None:
 
-            def get_annotation(self, p):
-                return None
-
-            def export_for_yolo(self, paths, base_dir, class_map, split=0.2):
-                return None
-
-        logger_sm.warning("Using dummy DatasetHandler defined in state_manager.py")
-
-    if "TrainingPipeline" not in globals():
-
-        class TrainingPipeline:
+        class _DummyTrainingPipeline:
             def __init__(self, cl, s, dh):
-                pass
+                self.class_to_id = {}
+                logger_sm.warning("Using dummy TrainingPipeline INSTANCE.")
 
             def cleanup(self):
                 pass
@@ -55,32 +103,29 @@ except ImportError as e:
                 pass
 
             def run_training_session(self, p, a, e, lr, pfx):
+                logger_sm.error("Dummy TP cannot run training.")
                 return None
 
             def auto_box(self, img, conf):
+                logger_sm.error("Dummy TP cannot auto_box.")
                 return []
 
-            class_to_id = {}
+        _TrainingPipeline = _DummyTrainingPipeline
+        logger_sm.warning(
+            f"Using dummy TrainingPipeline CLASS (Tier: {current_tier_for_import})."
+        )
 
-        logger_sm.warning("Using dummy TrainingPipeline defined in state_manager.py")
+if _PredictionWorker is None:
+    if "PredictionWorker" not in globals() or globals().get("PredictionWorker") is None:
 
-# Import worker classes
-try:
-    from workers import PredictionWorker, TrainingWorker
-
-    logger_sm.info("OK: Worker classes imported.")
-except ImportError:
-    logger_sm.error("Could not import worker classes. Threading will not work.")
-    # Define dummy workers if import fails
-    if "PredictionWorker" not in globals():
-
-        class PredictionWorker(QObject):
+        class _DummyPredictionWorker(QObject):
             progress = pyqtSignal(str)
             finished = pyqtSignal(list)
             error = pyqtSignal(str)
 
             def __init__(self, *args):
                 super().__init__()
+                logger_sm.warning("Using dummy PredictionWorker INSTANCE.")
 
             def run(self):
                 self.error.emit("Dummy Worker: Prediction unavailable")
@@ -88,17 +133,22 @@ except ImportError:
             def stop(self):
                 pass
 
-        logger_sm.warning("Using dummy PredictionWorker defined in state_manager.py")
+        _PredictionWorker = _DummyPredictionWorker
+        logger_sm.warning(
+            f"Using dummy PredictionWorker CLASS (Tier: {current_tier_for_import})."
+        )
 
-    if "TrainingWorker" not in globals():
+if _TrainingWorker is None:
+    if "TrainingWorker" not in globals() or globals().get("TrainingWorker") is None:
 
-        class TrainingWorker(QObject):
+        class _DummyTrainingWorker(QObject):
             progress = pyqtSignal(str)
-            finished = pyqtSignal(str)  # Emits run_dir path on success
+            finished = pyqtSignal(str)
             error = pyqtSignal(str)
 
             def __init__(self, *args):
                 super().__init__()
+                logger_sm.warning("Using dummy TrainingWorker INSTANCE.")
 
             def run(self):
                 self.error.emit("Dummy Worker: Training unavailable")
@@ -106,11 +156,20 @@ except ImportError:
             def stop(self):
                 pass
 
-        logger_sm.warning("Using dummy TrainingWorker defined in state_manager.py")
+        _TrainingWorker = _DummyTrainingWorker
+        logger_sm.warning(
+            f"Using dummy TrainingWorker CLASS (Tier: {current_tier_for_import})."
+        )
+
+# Assign final classes to be used
+DatasetHandler = _DatasetHandler
+TrainingPipeline = _TrainingPipeline  # Will be real (Pro) or dummy
+PredictionWorker = _PredictionWorker  # Will be real (Pro) or dummy
+TrainingWorker = _TrainingWorker  # Will be real (Pro) or dummy
 
 
 class StateManager(QObject):
-    # Signals
+    # Signals (Define all, but some only emitted in Pro)
     prediction_progress = pyqtSignal(str)
     prediction_finished = pyqtSignal(list)
     prediction_error = pyqtSignal(str)
@@ -127,9 +186,8 @@ class StateManager(QObject):
         self.annotations = {}
         self._settings = {}
         self._user_settings_path = config.DEFAULT_SETTINGS_PATH
-        self.load_settings()  # Load settings first
+        self.load_settings()
 
-        # Ensure directories exist based on loaded/default settings
         os.makedirs(os.path.dirname(self._user_settings_path), exist_ok=True)
         session_path_key = config.SETTING_KEYS.get("session_path", "paths.session_path")
         session_dir = os.path.dirname(
@@ -139,81 +197,81 @@ class StateManager(QObject):
             os.makedirs(session_dir, exist_ok=True)
         self.session_path = self.get_setting(
             session_path_key, config.DEFAULT_SESSION_PATH
-        )  # Store current path
+        )
 
         self.approved_count = 0
         self.class_list = sorted(list(set(class_list))) if class_list else []
-        self.last_successful_run_dir = None  # Initialize
+        self.last_successful_run_dir = None  # Pro feature artifact
 
-        # Create DatasetHandler instance
+        # Create DatasetHandler instance (using determined class)
         try:
-            # Use the potentially dummied DatasetHandler class from globals()
             self.dataset_handler = DatasetHandler()
             logger_sm.info("DatasetHandler initialized in StateManager.")
         except Exception as e:
             logger_sm.exception("FATAL: Failed DatasetHandler init.")
             self.dataset_handler = None
 
-        # Pass dataset_handler to TrainingPipeline
+        # --- TIERING: Initialize TrainingPipeline (Real or Dummy) ---
         try:
-            # Use the potentially dummied TrainingPipeline class from globals()
-            # Check if it's the real one by name convention
-            if (
-                "TrainingPipeline" in globals()
-                and TrainingPipeline.__name__ != "_DummyTrainingPipeline"
-            ):
-                self.training_pipeline = TrainingPipeline(
-                    class_list=self.class_list,
-                    settings=self._settings,
-                    dataset_handler=self.dataset_handler,
-                )
-                logger_sm.info("Real TrainingPipeline initialized.")
-            else:  # It's the dummy
-                # Make sure dummy can be initialized similarly if needed
-                self.training_pipeline = TrainingPipeline(
-                    self.class_list, self._settings, self.dataset_handler
-                )
-                logger_sm.warning("Using dummy TrainingPipeline instance.")
+            # Use the TrainingPipeline class determined by import logic
+            self.training_pipeline = TrainingPipeline(
+                class_list=self.class_list,
+                settings=self._settings,
+                dataset_handler=self.dataset_handler,  # Pass DH instance
+            )
+            # Log if it's the dummy
+            if TrainingPipeline.__name__.startswith("_Dummy"):
+                logger_sm.warning("Initialized DUMMY TrainingPipeline instance.")
+            else:
+                logger_sm.info("[PRO] Initialized REAL TrainingPipeline instance.")
         except Exception as e:
             logger_sm.exception("FATAL: Failed TrainingPipeline init.")
-            self.training_pipeline = None
+            self.training_pipeline = None  # Ensure it's None on failure
 
         # Apply loaded settings to pipeline etc.
         self.update_internal_from_settings()
 
-        # Task management attributes
         self._current_thread = None
         self._current_worker = None
         self._blocking_task_running = False
 
-        logger_sm.info(f"StateManager initialized. Save path: {self.session_path}")
+        # --- TIERING: Use current_tier attribute ---
+        self.current_tier = getattr(config, "TIER", "UNKNOWN")
+        logger_sm.info(
+            f"StateManager initialized for Tier: {self.current_tier}. "
+            f"Save path: {self.session_path}"
+        )
         logger_sm.info(f"User settings path: {self._user_settings_path}")
-        logger_sm.info(f"Initial last run dir: {self.last_successful_run_dir}")
 
     # --- Settings Management Methods ---
 
     def load_settings(self):
+        """Loads settings, applying defaults first."""
         self._settings = config.get_default_settings()
         logger_sm.info(f"Loading settings from: {self._user_settings_path}")
         try:
             if os.path.exists(self._user_settings_path):
                 with open(self._user_settings_path, "r") as f:
                     user_settings = json.load(f)
+                # Optional TIERING: Filter loaded settings here if needed
                 self._settings.update(user_settings)
                 logger_sm.info("Loaded user settings.")
             else:
                 logger_sm.info("No user settings file found, using defaults.")
-        except (json.JSONDecodeError, IOError, TypeError) as e:
+        except Exception as e:
             logger_sm.error(
-                f"Failed load/decode settings from {self._user_settings_path}: {e}. Using defaults.",
+                f"Failed load/decode settings {self._user_settings_path}: {e}. "
+                f"Using defaults.",
                 exc_info=True,
             )
             self._settings = config.get_default_settings()  # Reset on error
 
     def save_settings(self):
+        """Saves current settings dictionary to file."""
         logger_sm.debug(f"Saving settings to: {self._user_settings_path}")
         try:
             os.makedirs(os.path.dirname(self._user_settings_path), exist_ok=True)
+            # Optional TIERING: Filter settings before saving if needed
             with open(self._user_settings_path, "w") as f:
                 json.dump(self._settings, f, indent=4)
             logger_sm.info("User settings saved.")
@@ -223,19 +281,27 @@ class StateManager(QObject):
             )
 
     def get_setting(self, key, default=None):
+        """Gets a setting value, falling back to config defaults, then provided default."""
         config_default = config.get_default_settings().get(key)
         effective_default = config_default if config_default is not None else default
+        val = self._settings.get(key, effective_default)
+        # Ensure bools stay bools
         if isinstance(effective_default, bool):
-            return bool(self._settings.get(key, effective_default))
-        return self._settings.get(key, effective_default)
+            return bool(val)
+        return val
 
     def set_setting(self, key, value):
+        """Sets a setting value, attempts type conversion, saves, and notifies."""
         is_known_key = any(key == kp for kp in config.SETTING_KEYS.values())
         if not is_known_key:
             logger_sm.warning(f"Setting unknown key: {key}")
+
+        # Optional TIERING: Prevent setting Pro keys if Basic
+        # if self.current_tier == "BASIC" and key in PRO_ONLY_KEYS: return
+
         original_value = self._settings.get(key)
         new_value = value
-        try:
+        try:  # Attempt type conversion based on default type
             default_val = config.get_default_settings().get(key)
             expected_type = type(default_val) if default_val is not None else None
             if expected_type == bool:
@@ -248,19 +314,21 @@ class StateManager(QObject):
                 new_value = str(value)
         except (ValueError, TypeError):
             logger_sm.error(
-                f"Invalid type for setting '{key}': '{value}' (expected {expected_type}). Keeping previous value ('{original_value}')."
+                f"Invalid type for setting '{key}': '{value}'. Keeping '{original_value}'."
             )
             return
+
         if original_value != new_value:
             self._settings[key] = new_value
             logger_sm.info(f"Setting '{key}' updated to: {new_value}")
-            self.save_settings()  # Save immediately on change
+            self.save_settings()
             self.update_internal_from_settings(key)
             self.settings_changed.emit()
         else:
             logger_sm.debug(f"Setting '{key}' value unchanged: {new_value}")
 
     def update_internal_from_settings(self, changed_key=None):
+        """Updates internal state (like session path, pipeline settings) from settings dict."""
         logger_sm.debug(
             f"Updating internal state from settings (changed: {changed_key})."
         )
@@ -271,6 +339,8 @@ class StateManager(QObject):
             self.session_path = self.get_setting(
                 session_path_key, config.DEFAULT_SESSION_PATH
             )
+
+        # --- TIERING: Only update REAL pipeline if Pro ---
         pipeline_relevant_keys = [
             config.SETTING_KEYS.get(k)
             for k in [
@@ -282,32 +352,52 @@ class StateManager(QObject):
                 "aug_flipud",
                 "aug_fliplr",
                 "aug_degrees",
+                "base_model",
+                "model_save_path",
+                "runs_dir",
             ]
             if config.SETTING_KEYS.get(k)
         ]
-        if (
-            hasattr(self, "training_pipeline")
-            and self.training_pipeline
+        is_real_pipeline = (
+            self.training_pipeline
             and hasattr(self.training_pipeline, "update_settings")
+            and TrainingPipeline.__name__ != "_DummyTrainingPipeline"
+        )
+
+        if (
+            self.current_tier == "PRO"
+            and is_real_pipeline
+            and (changed_key is None or changed_key in pipeline_relevant_keys)
         ):
-            if changed_key is None or changed_key in pipeline_relevant_keys:
-                logger_sm.info(
-                    f"Pushing updated settings to TrainingPipeline (triggered by '{changed_key or 'initial load'}')."
+            logger_sm.info(
+                f"[PRO] Pushing updated settings to REAL TrainingPipeline "
+                f"(triggered by '{changed_key or 'initial load'}')."
+            )
+            try:
+                self.training_pipeline.update_settings(self._settings)
+            except Exception as e_pipe_update:
+                logger_sm.error(
+                    f"Error updating REAL training pipeline settings: {e_pipe_update}",
+                    exc_info=True,
                 )
-                try:
-                    self.training_pipeline.update_settings(self._settings)
-                except Exception as e_pipe_update:
-                    logger_sm.error(
-                        f"Error updating training pipeline settings: {e_pipe_update}",
-                        exc_info=True,
-                    )
+        elif changed_key in pipeline_relevant_keys:
+            # Log if a pipeline-relevant key changed but we skipped update
+            logger_sm.debug(
+                f"[{self.current_tier}/Pipeline:{TrainingPipeline.__name__}] "
+                f"Skipping pipeline settings update for key '{changed_key}'."
+            )
 
     def get_last_run_path(self):
+        """Returns the path to the last successful training run directory (Pro only)."""
+        # --- TIERING: This is a Pro artifact ---
+        if self.current_tier != "PRO":
+            return None
         return self.last_successful_run_dir
 
     # --- Core State Methods ---
 
     def load_session(self, file_path=None):
+        """Loads session data from a JSON file."""
         session_file = (
             file_path
             if file_path
@@ -319,7 +409,7 @@ class StateManager(QObject):
         try:
             if not os.path.exists(session_file):
                 logger_sm.warning(
-                    f"Session file not found: {session_file}. Initializing empty state."
+                    f"Session file not found: {session_file}. Init empty state."
                 )
                 self.image_list = []
                 self.annotations = {}
@@ -339,7 +429,12 @@ class StateManager(QObject):
             loaded_index = session_data.get("current_index", -1)
             loaded_classes = session_data.get("class_list", self.class_list)
 
-            loaded_run_dir = session_data.get("last_successful_run_dir")
+            # --- TIERING: Load Pro artifacts only if Pro ---
+            loaded_run_dir = (
+                session_data.get("last_successful_run_dir")
+                if self.current_tier == "PRO"
+                else None
+            )
             if (
                 loaded_run_dir
                 and isinstance(loaded_run_dir, str)
@@ -347,7 +442,7 @@ class StateManager(QObject):
             ):
                 self.last_successful_run_dir = loaded_run_dir
                 logger_sm.info(
-                    f"Loaded last successful run dir: {self.last_successful_run_dir}"
+                    f"[PRO] Loaded last successful run dir: {self.last_successful_run_dir}"
                 )
             else:
                 self.last_successful_run_dir = None
@@ -371,6 +466,7 @@ class StateManager(QObject):
             self.image_list = loaded_images if isinstance(loaded_images, list) else []
             self.annotations = loaded_anns if isinstance(loaded_anns, dict) else {}
 
+            # Clean up annotations for images not in the list
             keys_to_remove = [p for p in self.annotations if p not in self.image_list]
             if keys_to_remove:
                 logger_sm.warning(
@@ -379,17 +475,16 @@ class StateManager(QObject):
                 for k in keys_to_remove:
                     self.annotations.pop(k, None)
 
+            # Validate and set current index
             if not (
                 isinstance(loaded_index, int)
                 and 0 <= loaded_index < len(self.image_list)
             ):
                 self.current_index = 0 if self.image_list else -1
-                logger_sm.warning(
-                    f"Loaded index {loaded_index} invalid, reset to {self.current_index}."
-                )
             else:
                 self.current_index = loaded_index
 
+            # Recalculate approved count and update dataset handler
             self.approved_count = 0
             if self.dataset_handler:
                 self.dataset_handler.annotations.clear()
@@ -400,33 +495,24 @@ class StateManager(QObject):
                     if self.dataset_handler:
                         self.dataset_handler.update_annotation(img_path, data)
                 else:
-                    logger_sm.warning(
-                        f"Invalid annotation data type for {img_path} in session."
-                    )
+                    logger_sm.warning(f"Invalid ann data type for {img_path}.")
 
             if classes_changed:
-                self.update_pipeline_classes()
+                self.update_pipeline_classes()  # Updates real or dummy
 
             logger_sm.info(
-                f"Session loaded: {len(self.image_list)} images, {len(self.annotations)} annotations. "
-                f"Index: {self.current_index}. Approved: {self.approved_count}. "
-                f"Last Run: {os.path.basename(self.last_successful_run_dir) if self.last_successful_run_dir else 'None'}"
+                f"Session loaded: {len(self.image_list)} images, "
+                f"{len(self.annotations)} annots. Index: {self.current_index}. "
+                f"Approved: {self.approved_count}."
             )
             self.settings_changed.emit()
             return True
-
-        except json.JSONDecodeError as e:
-            logger_sm.error(
-                f"Error decoding JSON from {session_file}: {e}", exc_info=True
-            )
-            return False
         except Exception as e:
-            logger_sm.error(
-                f"Failed to load session from {session_file}: {e}", exc_info=True
-            )
+            logger_sm.error(f"Failed load session {session_file}: {e}", exc_info=True)
             return False
 
     def save_session(self):
+        """Saves current state (images, annotations, index, classes) to session file."""
         session_file = self.get_setting(
             config.SETTING_KEYS["session_path"], self.session_path
         )
@@ -436,25 +522,23 @@ class StateManager(QObject):
             "annotations": self.annotations,
             "current_index": self.current_index,
             "class_list": self.class_list,
-            "last_successful_run_dir": self.last_successful_run_dir,
+            # --- TIERING: Only include Pro artifacts if Pro ---
+            "last_successful_run_dir": self.last_successful_run_dir
+            if self.current_tier == "PRO"
+            else None,
         }
         try:
             save_dir = os.path.dirname(session_file)
             if save_dir:
                 os.makedirs(save_dir, exist_ok=True)
-            else:
-                logger_sm.warning(
-                    f"Session path '{session_file}' has no directory? Saving to current dir."
-                )
             with open(session_file, "w") as f:
                 json.dump(session_data, f, indent=4)
             logger_sm.info("Session saved successfully.")
         except Exception as e:
-            logger_sm.error(
-                f"Failed to save session to {session_file}: {e}", exc_info=True
-            )
+            logger_sm.error(f"Failed save session {session_file}: {e}", exc_info=True)
 
     def load_images_from_directory(self, directory_path):
+        """Loads image paths from a directory, resetting state if different."""
         logger_sm.info(f"Loading images from directory: {directory_path}")
         formats = tuple(
             f".{ext}"
@@ -470,9 +554,7 @@ class StateManager(QObject):
                 ]
             )
             if not image_files:
-                logger_sm.warning(
-                    f"No supported images found in {directory_path}. Clearing current state."
-                )
+                logger_sm.warning(f"No supported images in {directory_path}. Clearing.")
                 self.image_list = []
                 self.current_index = -1
                 self.annotations = {}
@@ -483,9 +565,7 @@ class StateManager(QObject):
             else:
                 is_new_or_different = set(image_files) != set(self.image_list)
                 if is_new_or_different:
-                    logger_sm.info(
-                        "New directory or content change detected. Resetting annotations and index."
-                    )
+                    logger_sm.info("New directory/content. Resetting annotations.")
                     self.image_list = image_files
                     self.current_index = 0
                     self.annotations = {}
@@ -494,60 +574,52 @@ class StateManager(QObject):
                     if self.dataset_handler:
                         self.dataset_handler.annotations.clear()
                 else:
-                    logger_sm.info(
-                        "Directory reloaded, image list content is identical. State unchanged."
-                    )
+                    logger_sm.info("Directory reloaded, content identical.")
 
+            # Ensure index is valid after potential reset
             if not (0 <= self.current_index < len(self.image_list)):
                 self.current_index = 0 if self.image_list else -1
-
             logger_sm.info(
                 f"Loaded {len(self.image_list)} images. Current index: {self.current_index}."
             )
-        except FileNotFoundError:
-            logger_sm.error(f"Directory not found: {directory_path}")
-            raise
         except Exception as e:
             logger_sm.error(f"Failed load images {directory_path}: {e}", exc_info=True)
             raise
 
     def get_current_image(self):
+        """Returns the path of the currently active image."""
         if self.image_list and 0 <= self.current_index < len(self.image_list):
             return self.image_list[self.current_index]
         return None
 
     def next_image(self):
+        """Moves to the next image index if possible."""
         if not self.image_list:
             return False
         if self.current_index < len(self.image_list) - 1:
             self.current_index += 1
-            logger_sm.debug(f"Navigated to next index: {self.current_index}")
             return True
-        logger_sm.debug("Already at last image.")
         return False
 
     def prev_image(self):
+        """Moves to the previous image index if possible."""
         if not self.image_list:
             return False
         if self.current_index > 0:
             self.current_index -= 1
-            logger_sm.debug(f"Navigated to previous index: {self.current_index}")
             return True
-        logger_sm.debug("Already at first image.")
         return False
 
     def go_to_image(self, index):
+        """Moves directly to the specified image index if valid."""
         if self.image_list and 0 <= index < len(self.image_list):
             if self.current_index != index:
                 self.current_index = index
-                logger_sm.debug(f"Navigated directly to index: {self.current_index}")
             return True
-        logger_sm.warning(
-            f"Invalid goto index: {index} (List size: {len(self.image_list)})"
-        )
         return False
 
     def update_classes(self, new_class_list):
+        """Updates the class list, removing annotations for deleted classes."""
         new_classes_clean = sorted(
             list(set(str(cls).strip() for cls in new_class_list if str(cls).strip()))
         )
@@ -555,7 +627,6 @@ class StateManager(QObject):
             logger_sm.info(
                 f"Updating class list from {self.class_list} to {new_classes_clean}"
             )
-            old_class_set = set(self.class_list)
             self.class_list = new_classes_clean
             valid_new_set = set(self.class_list)
             updated_anns = {}
@@ -566,11 +637,8 @@ class StateManager(QObject):
 
             for img_path, data in self.annotations.items():
                 if not isinstance(data, dict):
-                    logger_sm.warning(
-                        f"Skipping invalid annotation data for {img_path} during class update."
-                    )
                     continue
-                if data.get("negative", False):
+                if data.get("negative", False):  # Keep negatives
                     updated_anns[img_path] = data
                     if self.dataset_handler:
                         self.dataset_handler.update_annotation(img_path, data)
@@ -589,17 +657,14 @@ class StateManager(QObject):
                 new_data = data.copy()
                 new_data["annotations_list"] = filtered_boxes
                 updated_anns[img_path] = new_data
-
                 if img_had_removed:
                     affected_image_count += 1
                 if self.dataset_handler:
-                    self.dataset_handler.update_annotation(
-                        img_path, updated_anns[img_path]
-                    )
+                    self.dataset_handler.update_annotation(img_path, new_data)
 
             if removed_box_count > 0:
                 logger_sm.warning(
-                    f"Removed {removed_box_count} annotation boxes from {affected_image_count} images due to class change."
+                    f"Removed {removed_box_count} boxes from {affected_image_count} images."
                 )
             self.annotations = updated_anns
             self.approved_count = sum(
@@ -615,34 +680,30 @@ class StateManager(QObject):
             logger_sm.info("Class list unchanged.")
 
     def update_pipeline_classes(self):
-        if self.training_pipeline and hasattr(self.training_pipeline, "update_classes"):
-            logger_sm.info("Updating TrainingPipeline classes...")
+        """Updates the classes in the training pipeline instance (if real)."""
+        is_real_pipeline = (
+            self.training_pipeline
+            and hasattr(self.training_pipeline, "update_classes")
+            and TrainingPipeline.__name__ != "_DummyTrainingPipeline"
+        )
+        if self.current_tier == "PRO" and is_real_pipeline:
+            logger_sm.info("[PRO] Updating REAL TrainingPipeline classes...")
             try:
                 self.training_pipeline.update_classes(self.class_list)
-                logger_sm.info("Pipeline classes updated successfully.")
+                logger_sm.info("Pipeline classes updated.")
             except Exception as e:
-                logger_sm.error("Failed to update pipeline classes.", exc_info=True)
+                logger_sm.error("Failed update pipeline classes.", exc_info=True)
         elif self.training_pipeline:
-            logger_sm.error(
-                "TrainingPipeline instance missing 'update_classes' method."
-            )
+            logger_sm.debug("Skipping pipeline class update (Dummy/method missing).")
         else:
-            logger_sm.warning(
-                "Cannot update pipeline classes: No TrainingPipeline instance."
-            )
+            logger_sm.warning("Cannot update pipeline classes: No Pipeline instance.")
 
     # --- Annotation & Training Trigger ---
 
     def add_annotation(self, image_path, annotation_data):
-        if not image_path:
-            logger_sm.error("add_annotation failed: No image_path provided.")
+        """Adds/updates annotation for an image, updates counts, saves, triggers training (Pro)."""
+        if not image_path or not isinstance(annotation_data, dict):
             return False
-        if not isinstance(annotation_data, dict):
-            logger_sm.error(
-                f"add_annotation failed: Invalid annotation_data type for {image_path}"
-            )
-            return False
-
         logger_sm.info(f"Updating annotation state for {os.path.basename(image_path)}")
         was_approved_before = self.annotations.get(image_path, {}).get(
             "approved", False
@@ -650,158 +711,171 @@ class StateManager(QObject):
         is_approved_now = annotation_data.get("approved", False)
         self.annotations[image_path] = annotation_data
 
-        if is_approved_now and not was_approved_before:
-            self.approved_count += 1
-        elif not is_approved_now and was_approved_before:
-            self.approved_count -= 1
-        self.approved_count = max(0, self.approved_count)
-        logger_sm.debug(f"Approved count updated: {self.approved_count}")
+        # Update approved count
+        if is_approved_now != was_approved_before:
+            self.approved_count += 1 if is_approved_now else -1
+            self.approved_count = max(0, self.approved_count)
+            logger_sm.debug(f"Approved count updated: {self.approved_count}")
 
-        if self.dataset_handler and hasattr(self.dataset_handler, "update_annotation"):
+        # Update dataset handler
+        if self.dataset_handler:
             self.dataset_handler.update_annotation(image_path, annotation_data)
-        else:
-            logger_sm.warning(
-                "Cannot update DatasetHandler: Instance or method missing."
+
+        # Save session asynchronously
+        QTimer.singleShot(100, self.save_session)
+
+        # --- TIERING: Training Triggers (PRO ONLY) ---
+        if is_approved_now and not was_approved_before:
+            is_real_pipeline = (
+                self.training_pipeline
+                and TrainingPipeline.__name__ != "_DummyTrainingPipeline"
             )
+            # Only check triggers if PRO tier and REAL pipeline exists
+            if self.current_tier == "PRO" and is_real_pipeline:
+                current_count = self.approved_count
+                epochs, lr, prefix = None, None, None
+                trigger_level = None
 
-        QTimer.singleShot(100, self.save_session)  # Save asynchronously
-
-        # --- Training Triggers (MODIFIED) ---
-        if is_approved_now and not was_approved_before and self.training_pipeline:
-            current_approved_count = self.approved_count
-            epochs, lr, prefix = None, None, None
-            trigger_level = None
-
-            # Get Enable Settings
-            trigger_20_enabled = self.get_setting(
-                config.SETTING_KEYS["training.trigger_20_enabled"], True
-            )
-            trigger_100_enabled = self.get_setting(
-                config.SETTING_KEYS["training.trigger_100_enabled"], True
-            )
-            logger_sm.debug(
-                f"Checking triggers: 20_enabled={trigger_20_enabled}, 100_enabled={trigger_100_enabled}"
-            )
-
-            # Apply Enable Settings to Trigger Logic
-            if (
-                trigger_100_enabled
-                and current_approved_count > 0
-                and current_approved_count % 100 == 0
-            ):
-                trigger_level = 100
-            elif (
-                trigger_20_enabled
-                and current_approved_count > 0
-                and current_approved_count % 20 == 0
-            ):
-                if trigger_level != 100:
-                    trigger_level = 20
-
-            # Determine parameters based on triggered level
-            if trigger_level == 100:
-                logger_sm.info(
-                    f"Approved count {current_approved_count}: Triggering MAJOR (100) training."
+                trig_20_en = self.get_setting(
+                    config.SETTING_KEYS["training.trigger_20_enabled"], True
                 )
-                epochs_key = config.SETTING_KEYS.get("epochs_100")
-                lr_key = config.SETTING_KEYS.get("lr_100")
-                epochs = self.get_setting(epochs_key, config.DEFAULT_EPOCHS_100)
-                lr = self.get_setting(lr_key, config.DEFAULT_LR_100)
-                prefix = f"major_{current_approved_count}"
-            elif trigger_level == 20:
-                logger_sm.info(
-                    f"Approved count {current_approved_count}: Triggering MINI (20) training."
+                trig_100_en = self.get_setting(
+                    config.SETTING_KEYS["training.trigger_100_enabled"], True
                 )
-                epochs_key = config.SETTING_KEYS.get("epochs_20")
-                lr_key = config.SETTING_KEYS.get("lr_20")
-                epochs = self.get_setting(epochs_key, config.DEFAULT_EPOCHS_20)
-                lr = self.get_setting(lr_key, config.DEFAULT_LR_20)
-                prefix = f"mini_{current_approved_count}"
+                logger_sm.debug(
+                    f"[PRO] Checking triggers: 20={trig_20_en}, 100={trig_100_en}"
+                )
 
-            # Schedule Task if parameters determined
-            if epochs is not None and lr is not None and prefix is not None:
-                logger_sm.info(
-                    f"Scheduling {prefix} training task (Epochs: {epochs}, LR: {lr:.6f})."
-                )
-                QTimer.singleShot(
-                    150,
-                    lambda e=epochs, l=lr, p=prefix: self.start_training_task(e, l, p),
-                )
-        elif not self.training_pipeline and is_approved_now and not was_approved_before:
-            logger_sm.error(
-                f"Annotation approved, but cannot trigger training: Pipeline unavailable."
-            )
+                if trig_100_en and current_count > 0 and current_count % 100 == 0:
+                    trigger_level = 100
+                elif trig_20_en and current_count > 0 and current_count % 20 == 0:
+                    if trigger_level != 100:  # 100 takes precedence
+                        trigger_level = 20
 
+                if trigger_level == 100:
+                    logger_sm.info(
+                        f"[PRO] Count {current_count}: Triggering MAJOR train."
+                    )
+                    epochs = self.get_setting(
+                        config.SETTING_KEYS.get("epochs_100"), config.DEFAULT_EPOCHS_100
+                    )
+                    lr = self.get_setting(
+                        config.SETTING_KEYS.get("lr_100"), config.DEFAULT_LR_100
+                    )
+                    prefix = f"major_{current_count}"
+                elif trigger_level == 20:
+                    logger_sm.info(
+                        f"[PRO] Count {current_count}: Triggering MINI train."
+                    )
+                    epochs = self.get_setting(
+                        config.SETTING_KEYS.get("epochs_20"), config.DEFAULT_EPOCHS_20
+                    )
+                    lr = self.get_setting(
+                        config.SETTING_KEYS.get("lr_20"), config.DEFAULT_LR_20
+                    )
+                    prefix = f"mini_{current_count}"
+
+                if epochs is not None and lr is not None and prefix is not None:
+                    logger_sm.info(
+                        f"[PRO] Scheduling {prefix} training task (E:{epochs}, LR:{lr:.6f})."
+                    )
+                    QTimer.singleShot(
+                        150,
+                        lambda e=epochs, l=lr, p=prefix: self.start_training_task(
+                            e, l, p
+                        ),
+                    )
+            elif not self.training_pipeline:
+                logger_sm.error("Approved, but cannot trigger train: Pipeline missing.")
+            else:  # Basic tier or dummy pipeline
+                logger_sm.debug("[BASIC/Dummy] Skipping auto train triggers.")
         return True
 
     # --- Task Management ---
 
     def start_prediction(self, image_path):
-        logger_sm.debug(f"Request start prediction for {os.path.basename(image_path)}")
-        if "PredictionWorker" not in globals() or not issubclass(
-            globals()["PredictionWorker"], QObject
-        ):
-            logger_sm.error("PredictionWorker class unavailable or invalid.")
-            self.prediction_error.emit("Prediction unavailable (Worker missing).")
+        """Starts a background prediction task (PRO ONLY)."""
+        # --- TIERING: PRO ONLY ---
+        if self.current_tier != "PRO":
+            logger_sm.warning("[BASIC] AI Suggestions (Prediction) require Pro.")
+            self.prediction_error.emit("AI Suggestions require Pro tier.")
             return False
-        current_confidence = self.get_setting(
-            config.SETTING_KEYS["confidence_threshold"]
+
+        logger_sm.debug(
+            f"[PRO] Request start prediction for {os.path.basename(image_path)}"
         )
-        return self._start_task(
-            globals()["PredictionWorker"], image_path, current_confidence
-        )
+        # Check if the REAL worker class is available
+        if PredictionWorker.__name__.startswith("_Dummy"):
+            logger_sm.error("[PRO] PredictionWorker is DUMMY. Prediction unavailable.")
+            self.prediction_error.emit("Prediction unavailable (Worker missing/dummy).")
+            return False
+
+        current_conf = self.get_setting(config.SETTING_KEYS["confidence_threshold"])
+        return self._start_task(PredictionWorker, image_path, current_conf)
 
     def start_training_task(self, epochs, lr, run_name_prefix):
-        if "TrainingWorker" not in globals() or not issubclass(
-            globals()["TrainingWorker"], QObject
-        ):
-            logger_sm.error("TrainingWorker class unavailable or invalid.")
-            self.training_error.emit("Training unavailable (Worker missing).")
+        """Starts a background training task (PRO ONLY)."""
+        # --- TIERING: PRO ONLY ---
+        if self.current_tier != "PRO":
+            logger_sm.warning("[BASIC] Training requires Pro tier.")
+            self.training_error.emit("Training requires Pro tier.")
             return False
 
-        logger_sm.info(f"Preparing data for training run '{run_name_prefix}'...")
-        approved_annotations = {
+        # Check if the REAL worker class is available
+        if TrainingWorker.__name__.startswith("_Dummy"):
+            logger_sm.error("[PRO] TrainingWorker is DUMMY. Training unavailable.")
+            self.training_error.emit("Training unavailable (Worker missing/dummy).")
+            return False
+
+        logger_sm.info(f"[PRO] Preparing data for training run '{run_name_prefix}'...")
+        approved_anns = {
             p: data
             for p, data in self.annotations.items()
             if isinstance(data, dict) and data.get("approved")
         }
-        approved_paths = list(approved_annotations.keys())
+        approved_paths = list(approved_anns.keys())
 
         if not approved_paths:
-            logger_sm.warning("No approved images found for training.")
-            self.training_error.emit("No approved images for training")
+            logger_sm.warning("No approved images for training.")
+            self.training_error.emit("No approved images")
             return False
 
         logger_sm.info(
-            f"Request start {run_name_prefix} training on {len(approved_paths)} images (Epochs: {epochs}, LR: {lr})."
+            f"[PRO] Request start {run_name_prefix} training on "
+            f"{len(approved_paths)} images (E: {epochs}, LR: {lr})."
         )
         return self._start_task(
-            globals()["TrainingWorker"],
-            approved_paths,
-            approved_annotations,
-            epochs,
-            lr,
-            run_name_prefix,
+            TrainingWorker, approved_paths, approved_anns, epochs, lr, run_name_prefix
         )
 
     def _start_task(self, worker_class, *args):
+        """Internal helper to create and start worker threads."""
         task_name = worker_class.__name__
-        if not self.training_pipeline or not hasattr(
-            self.training_pipeline, "run_training_session"
-        ):
-            error_msg = f"Cannot start {task_name}: Pipeline unavailable or invalid."
+        is_real_pipeline = (
+            self.training_pipeline
+            and TrainingPipeline.__name__ != "_DummyTrainingPipeline"
+        )
+        is_real_worker = not worker_class.__name__.startswith("_Dummy")
+
+        # Prevent REAL workers if pipeline is DUMMY
+        if is_real_worker and not is_real_pipeline:
+            error_msg = (
+                f"Cannot start REAL {task_name}: Pipeline is dummy or unavailable."
+            )
             logger_sm.error(error_msg)
-            if task_name == "PredictionWorker":
+            is_pred = "Prediction" in task_name
+            if is_pred:
                 self.prediction_error.emit(error_msg)
-            elif task_name == "TrainingWorker":
+            else:
                 self.training_error.emit(error_msg)
             return False
 
         if self._blocking_task_running:
             logger_sm.warning(f"Cannot start {task_name}: Another task running.")
-            if task_name == "PredictionWorker":
+            is_pred = "Prediction" in task_name
+            if is_pred:
                 self.prediction_error.emit("Busy: Another task running.")
-            elif task_name == "TrainingWorker":
+            else:
                 self.training_error.emit("Busy: Another task running.")
             return False
 
@@ -813,35 +887,31 @@ class StateManager(QObject):
             self._current_worker = worker_class(self.training_pipeline, *args)
             self._current_worker.moveToThread(self._current_thread)
 
-            if isinstance(self._current_worker, PredictionWorker):
-                self._current_worker.progress.connect(self.prediction_progress)
-                self._current_worker.finished.connect(self.prediction_finished)
-                self._current_worker.error.connect(self.prediction_error)
+            # Connect signals (should exist on both real and dummy)
+            is_pred = "Prediction" in task_name
+            if hasattr(self._current_worker, "progress"):
+                sig = self.prediction_progress if is_pred else self.training_progress
+                self._current_worker.progress.connect(sig)
+            if hasattr(self._current_worker, "finished"):
+                sig = (
+                    self.prediction_finished if is_pred else self.training_run_completed
+                )
+                self._current_worker.finished.connect(sig)
+            if hasattr(self._current_worker, "error"):
+                sig = self.prediction_error if is_pred else self.training_error
+                self._current_worker.error.connect(sig)
+
+            # Connect finished/error to internal cleanup handler
+            task_id_name = self._current_worker.__class__.__name__
+            if hasattr(self._current_worker, "finished"):
                 self._current_worker.finished.connect(
-                    lambda result=None,
-                    worker=self._current_worker: self._on_task_finished(
-                        worker.__class__.__name__, result
+                    lambda result=None, name=task_id_name: self._on_task_finished(
+                        name, result
                     )
                 )
+            if hasattr(self._current_worker, "error"):
                 self._current_worker.error.connect(
-                    lambda worker=self._current_worker: self._on_task_finished(
-                        worker.__class__.__name__, None
-                    )
-                )
-            elif isinstance(self._current_worker, TrainingWorker):
-                self._current_worker.progress.connect(self.training_progress)
-                self._current_worker.finished.connect(self.training_run_completed)
-                self._current_worker.error.connect(self.training_error)
-                self._current_worker.finished.connect(
-                    lambda result=None,
-                    worker=self._current_worker: self._on_task_finished(
-                        worker.__class__.__name__, result
-                    )
-                )
-                self._current_worker.error.connect(
-                    lambda worker=self._current_worker: self._on_task_finished(
-                        worker.__class__.__name__, None
-                    )
+                    lambda name=task_id_name: self._on_task_finished(name, None)
                 )
 
             self._current_thread.started.connect(self._current_worker.run)
@@ -860,9 +930,10 @@ class StateManager(QObject):
         except Exception as e:
             logger_sm.exception(f"Error starting worker thread {task_name}")
             error_msg = f"Setup error for {task_name}: {e}"
-            if task_name == "PredictionWorker":
+            is_pred = "Prediction" in task_name
+            if is_pred:
                 self.prediction_error.emit(error_msg)
-            elif task_name == "TrainingWorker":
+            else:
                 self.training_error.emit(error_msg)
             if self._current_thread:
                 self._current_thread.quit()
@@ -873,32 +944,35 @@ class StateManager(QObject):
             return False
 
     def _on_task_finished(self, task_name, result=None):
+        """Internal slot called when a worker finishes or errors."""
         logger_sm.info(
             f"Internal handler: Background task ({task_name}) finished/errored."
         )
 
+        # --- TIERING: Store last run dir only if Pro ---
+        is_training_task = "TrainingWorker" in task_name
         if (
-            task_name == "TrainingWorker"
+            self.current_tier == "PRO"
+            and is_training_task
             and isinstance(result, str)
             and os.path.isdir(result)
         ):
             self.last_successful_run_dir = result
-            logger_sm.info(f"Stored last successful run directory: {result}")
-            QTimer.singleShot(50, self.save_session)
-        elif task_name == "PredictionWorker" and isinstance(result, list):
+            logger_sm.info(f"[PRO] Stored last successful run directory: {result}")
+            QTimer.singleShot(50, self.save_session)  # Persist run dir
+        elif "PredictionWorker" in task_name and isinstance(result, list):
             logger_sm.debug(f"Prediction task finished with {len(result)} results.")
         elif result is None:
             logger_sm.warning(f"{task_name} task finished with error or no result.")
 
+        # Thread cleanup logic
         thread_to_clean = self._current_thread
         if thread_to_clean:
             logger_sm.debug(f"Cleaning up thread for {task_name}...")
             if thread_to_clean.isRunning():
                 thread_to_clean.quit()
                 if not thread_to_clean.wait(5000):
-                    logger_sm.warning(
-                        f"Thread ({task_name}) did not finish cleanup within 5s."
-                    )
+                    logger_sm.warning(f"Thread ({task_name}) didn't finish cleanup.")
                 else:
                     logger_sm.debug(f"Thread ({task_name}) finished cleanly.")
             else:
@@ -906,16 +980,18 @@ class StateManager(QObject):
 
         if self._blocking_task_running:
             self._blocking_task_running = False
-            self.task_running.emit(False)  # Notify GUI
+            self.task_running.emit(False)
 
         self._current_thread = None
         self._current_worker = None
         logger_sm.debug(f"{task_name} task finished processing complete.")
 
     def is_task_active(self):
+        """Returns True if a blocking background task is running."""
         return self._blocking_task_running
 
     def cleanup(self):
+        """Cleans up resources, attempts to stop running workers."""
         logger_sm.info("StateManager cleanup initiated.")
         if (
             self._blocking_task_running
@@ -923,9 +999,7 @@ class StateManager(QObject):
             and hasattr(self._current_worker, "stop")
         ):
             worker_name = self._current_worker.__class__.__name__
-            logger_sm.warning(
-                f"Attempting cooperative stop of running worker ({worker_name})."
-            )
+            logger_sm.warning(f"Attempting stop of running worker ({worker_name}).")
             try:
                 self._current_worker.stop()
             except Exception as e:
@@ -935,44 +1009,54 @@ class StateManager(QObject):
         if thread_to_clean and thread_to_clean.isRunning():
             logger_sm.info("Waiting for running thread during cleanup...")
             if not thread_to_clean.wait(7000):
-                logger_sm.warning(
-                    "Worker thread did not finish gracefully during cleanup."
-                )
+                logger_sm.warning("Worker thread didn't finish gracefully.")
             else:
                 logger_sm.info("Worker thread finished during cleanup.")
 
-        if self.training_pipeline and hasattr(self.training_pipeline, "cleanup"):
+        # --- TIERING: Only cleanup REAL pipeline if Pro ---
+        is_real_pipeline = (
+            self.training_pipeline
+            and hasattr(self.training_pipeline, "cleanup")
+            and TrainingPipeline.__name__ != "_DummyTrainingPipeline"
+        )
+        if self.current_tier == "PRO" and is_real_pipeline:
             try:
                 self.training_pipeline.cleanup()
-                logger_sm.info("Training pipeline cleanup called.")
+                logger_sm.info("[PRO] REAL Training pipeline cleanup called.")
             except Exception as e:
                 logger_sm.error(
-                    f"Error during TrainingPipeline cleanup: {e}", exc_info=True
+                    f"Error during REAL TrainingPipeline cleanup: {e}", exc_info=True
                 )
+        elif self.training_pipeline and hasattr(self.training_pipeline, "cleanup"):
+            logger_sm.debug("Skipping cleanup for DUMMY pipeline.")
 
         self._current_worker = None
         self._current_thread = None
         self._blocking_task_running = False
         logger_sm.info("StateManager cleanup finished.")
 
-    # --- Data Export ---
+    # --- Data Export (Basic & Pro) ---
 
     def export_data_for_yolo(self, target_dir):
+        """Exports approved annotations in YOLO format."""
+        # This is needed for Basic tier as well.
         logger_sm.info(f"Attempting export YOLO data to: {target_dir}")
         if not self.dataset_handler:
-            logger_sm.error("Cannot export: DatasetHandler not available.")
+            logger_sm.error("Cannot export: DatasetHandler unavailable.")
             return None
         if not hasattr(self.dataset_handler, "export_for_yolo"):
-            logger_sm.error(
-                "Cannot export: DatasetHandler missing 'export_for_yolo' method."
-            )
+            logger_sm.error("Cannot export: DH missing 'export_for_yolo'.")
             return None
+
+        # Get class map - needed for export regardless of tier.
         if not self.training_pipeline or not hasattr(
             self.training_pipeline, "class_to_id"
         ):
-            logger_sm.error(
-                "Cannot export: Training pipeline or class_to_id map missing."
-            )
+            logger_sm.error("Cannot export: Pipeline (real/dummy) or map missing.")
+            return None
+        class_to_id = self.training_pipeline.class_to_id
+        if not class_to_id:  # Check if map is empty
+            logger_sm.error("Cannot export: Class map is empty.")
             return None
 
         approved_paths = [
@@ -988,44 +1072,34 @@ class StateManager(QObject):
             p: self.annotations[p] for p in approved_paths if p in self.annotations
         }
         if not export_annotations:
-            logger_sm.error("No valid annotation data found for approved paths.")
+            logger_sm.error("No valid annotation data for approved paths.")
             return None
 
-        class_to_id = self.training_pipeline.class_to_id
-        if not class_to_id:
-            logger_sm.error(
-                "Cannot export: Class map from pipeline is empty or invalid."
-            )
-            return None
-
+        # Use the potentially DUMMY DatasetHandler instance
         original_handler_anns = None
         yaml_path = None
         try:
+            # Temporarily set the annotations on the handler instance
             original_handler_anns = self.dataset_handler.annotations.copy()
             self.dataset_handler.annotations = export_annotations
             logger_sm.debug(
-                f"Temporarily set DatasetHandler with {len(export_annotations)} annotations for export."
+                f"Temporarily set DH with {len(export_annotations)} annotations."
             )
+            # Call export on the handler instance (could be real or dummy)
             yaml_path = self.dataset_handler.export_for_yolo(
                 image_paths_to_export=list(export_annotations.keys()),
                 base_export_dir=target_dir,
                 class_to_id=class_to_id,
-                val_split=0.0,
+                val_split=0.2,  # Basic can still have a validation split
             )
         except Exception as e:
             logger_sm.exception(
                 f"Error during dataset_handler.export_for_yolo call to {target_dir}"
             )
             yaml_path = None
-        finally:
+        finally:  # Restore original annotations on the handler
             if original_handler_anns is not None and self.dataset_handler:
                 self.dataset_handler.annotations = original_handler_anns
-                logger_sm.debug(
-                    "Restored original annotations in DatasetHandler after export attempt."
-                )
-            elif not self.dataset_handler:
-                logger_sm.error("Cannot restore annotations: DatasetHandler is None.")
+                logger_sm.debug("Restored original annotations in DatasetHandler.")
+
         return yaml_path
-
-
-# --- End of state_manager.py Modifications ---

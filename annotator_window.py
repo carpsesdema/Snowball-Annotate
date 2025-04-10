@@ -1,7 +1,10 @@
+# annotator_window.py (Completed Tiering Integration)
+
 import logging
 import os
 import sys
 import shutil
+import inspect  # Added for logging method names
 
 # --- PyQt6 Imports ---
 from PyQt6.QtCore import (
@@ -19,7 +22,7 @@ from PyQt6.QtGui import (
     QColor,
     QPen,
     QDesktopServices,
-    QIcon,  # QIcon might be needed later
+    QIcon,
 )
 from PyQt6.QtWidgets import (
     QMainWindow,
@@ -37,166 +40,257 @@ from PyQt6.QtWidgets import (
     QCheckBox,
     QToolButton,
     QGraphicsItem,
-    QGraphicsScene,  # Added QGraphicsScene here
+    QGraphicsScene,
+    QGraphicsTextItem,  # Added for negative image indicator
 )
 
-import config
+import config  # --- TIERING: Needed for config.TIER ---
 
-# --- State Manager Import ---
+# --- State Manager Import (Conditional based on Tier) ---
 _StateManager = None
-try:
-    from state_manager import StateManager as _StateManager  # Import real one
+# Use module-level logger early
+logger = logging.getLogger(__name__)
+# Ensure config.TIER was set by main.py before this module is imported.
+logger.info(
+    f"--- AnnotatorWindow: Checking Tier for StateManager Import "
+    f"(Tier={getattr(config, 'TIER', 'UNKNOWN')}) ---"
+)
 
-    if not hasattr(_StateManager, "add_annotation"):
-        # Basic check if it's real
-        logging.warning(
-            "Imported StateManager looks incomplete, falling back to dummy."
+# --- TIERING: Try importing REAL StateManager ONLY if PRO tier ---
+if hasattr(config, "TIER") and config.TIER == "PRO":
+    try:
+        from state_manager import StateManager as _StateManager
+
+        if not hasattr(_StateManager, "add_annotation"):
+            logger.warning(
+                "Imported StateManager looks incomplete, falling back to dummy."
+            )
+            _StateManager = None
+        else:
+            logger.info("OK: Real StateManager imported for PRO tier.")
+    except ImportError as e:
+        logger.critical(f"FAIL: PRO tier StateManager Import: {e}", exc_info=True)
+        _StateManager = None
+    except Exception as e_sm:
+        logger.critical(
+            f"FAIL: Error during PRO StateManager import/check: {e_sm}", exc_info=True
         )
-        _StateManager = None  # Force fallback
-    else:
-        logging.info("OK: StateManager imported.")
-except ImportError as e:
-    logging.critical(f"FAIL: StateManager Import: {e}", exc_info=True)
-    _StateManager = None
-except Exception as e_sm:
-    logging.critical(
-        f"FAIL: Error during StateManager import/check: {e_sm}", exc_info=True
+        _StateManager = None
+else:
+    logger.info(
+        f"[BASIC/UNKNOWN Tier] Tier detected ({getattr(config, 'TIER', 'UNKNOWN')}). "
+        f"Will use DUMMY StateManager."
     )
-    _StateManager = None
 
+# --- TIERING: Fallback to DUMMY if not PRO or if PRO import failed ---
 if _StateManager is None:
     try:
-        # Ensure this matches the class name in dummy_components.py
         from dummy_components import _DummyStateManager as _StateManager
 
-        logging.warning("Using DUMMY StateManager from dummy_components.")
-    except ImportError as e_dummy_sm:
-        logging.critical(
-            f"CRITICAL: Failed to import even DUMMY StateManager: {e_dummy_sm}"
+        logger.warning(
+            f"Using DUMMY StateManager (Tier: {getattr(config, 'TIER', 'UNKNOWN')})."
         )
+    except ImportError as e_dummy_sm:
+        logger.critical(f"CRITICAL: Failed to import DUMMY StateManager: {e_dummy_sm}")
         print(f"[CRITICAL] Cannot load StateManager or its dummy: {e_dummy_sm}")
-        sys.exit(1)  # Exit if essential state management cannot be loaded
+        # Avoid UI popup here, main.py handles startup errors. Raise exception?
+        raise ImportError(
+            f"Cannot load StateManager or its dummy: {e_dummy_sm}"
+        ) from e_dummy_sm
 
-# Assign the determined class (real or dummy) to the name used in the rest of the file
+# Assign the determined class
 StateManager = _StateManager
 
-# --- GUI Component Import ---
+# --- GUI Component Import (Conditional based on Tier) ---
 _AnnotationScene = None
 _AnnotatorGraphicsView = None
-_SettingsDialog = None
-_ResizableRectItem = None
-_TrainingDashboard = None
+_SettingsDialog = None  # Assume Basic might need some settings?
+_ResizableRectItem = None  # Needed for Basic
+_TrainingDashboard = None  # PRO Only
+# --- TIERING: Add import for backend TrainingPipeline to check its type ---
+_TrainingPipeline = None  # Will be imported conditionally below
+
+logger.info(
+    f"--- AnnotatorWindow: Checking Tier for GUI Component Import "
+    f"(Tier={getattr(config, 'TIER', 'UNKNOWN')}) ---"
+)
+
 try:
-    # Try importing real GUI components
-    # NOTE: We expect gui.py to have the modified ResizableRectItem
+    # Try importing components needed for Basic (and potentially shared by Pro)
     from gui import (
         AnnotationScene as _AnnotationScene,
         AnnotatorGraphicsView as _AnnotatorGraphicsView,
-        SettingsDialog as _SettingsDialog,
-        ResizableRectItem as _ResizableRectItem,  # Should now have suggestion logic
-        TrainingDashboard as _TrainingDashboard,
+        SettingsDialog as _SettingsDialog,  # Keep for Basic for now
+        ResizableRectItem as _ResizableRectItem,  # Essential for Basic
     )
 
-    # Basic check (can add more checks if needed)
+    # Basic check
     if not issubclass(_AnnotationScene, QGraphicsScene):
-        logging.warning(
+        logger.warning(
             "Imported AnnotationScene is not a QGraphicsScene subclass. Falling back."
         )
-        _AnnotationScene = None  # Force fallback
+        _AnnotationScene = None  # Force fallback for essential component
     else:
-        logging.info("OK: gui components imported.")
+        logger.info("OK: Basic GUI components imported.")
+
+    # --- TIERING: Import PRO-only GUI components conditionally ---
+    if hasattr(config, "TIER") and config.TIER == "PRO":
+        try:
+            from gui import TrainingDashboard as _TrainingDashboard
+
+            logger.info("OK: TrainingDashboard imported for PRO tier.")
+            # --- TIERING: Also import real TrainingPipeline for checks ---
+            from training_pipeline import TrainingPipeline as _TrainingPipeline
+
+            logger.info("OK: Real TrainingPipeline imported for PRO tier checks.")
+        except ImportError as e_pro_gui:
+            logger.warning(f"Could not import PRO tier component: {e_pro_gui}.")
+            if "TrainingDashboard" in str(e_pro_gui):
+                _TrainingDashboard = None
+            if "TrainingPipeline" in str(e_pro_gui):
+                _TrainingPipeline = None
+    else:
+        logger.info(
+            f"[BASIC/UNKNOWN Tier] Tier detected ({getattr(config, 'TIER', 'UNKNOWN')}). "
+            f"Skipping PRO GUI/Backend imports."
+        )
+        _TrainingDashboard = None
+        _TrainingPipeline = None
+
 except ImportError as e_gui:
-    logging.critical(f"FAIL: gui components import: {e_gui}", exc_info=True)
-    # Ensure all are None if any fail
+    logger.critical(f"FAIL: Basic gui components import: {e_gui}", exc_info=True)
+    # Ensure all are None if any basic fail, triggering full dummy fallback below
     _AnnotationScene = None
     _AnnotatorGraphicsView = None
     _SettingsDialog = None
     _ResizableRectItem = None
     _TrainingDashboard = None
+    _TrainingPipeline = None
 except Exception as e_gui_other:
-    logging.critical(
-        f"FAIL: Error during GUI component import/check: {e_gui_other}", exc_info=True
+    logger.critical(
+        f"FAIL: Error during Basic GUI component import/check: {e_gui_other}",
+        exc_info=True,
     )
-    # Ensure all are None if any fail
     _AnnotationScene = None
     _AnnotatorGraphicsView = None
     _SettingsDialog = None
     _ResizableRectItem = None
     _TrainingDashboard = None
+    _TrainingPipeline = None
 
 # Fallback to dummies if real ones failed or weren't assigned
-if _AnnotationScene is None:
+# Fallback for BASIC components
+if (
+    _AnnotationScene is None
+    or _AnnotatorGraphicsView is None
+    or _SettingsDialog is None
+    or _ResizableRectItem is None
+):
+    logger.warning(
+        "One or more basic GUI components failed import. Attempting DUMMY fallbacks."
+    )
     try:
-        from dummy_components import DummyAnnotationScene as _AnnotationScene
-        from dummy_components import (
-            DummyAnnotatorGraphicsView as _AnnotatorGraphicsView,
+        if _AnnotationScene is None:
+            from dummy_components import DummyAnnotationScene as _AnnotationScene
+        if _AnnotatorGraphicsView is None:
+            from dummy_components import (
+                DummyAnnotatorGraphicsView as _AnnotatorGraphicsView,
+            )
+        if _SettingsDialog is None:
+            from dummy_components import DummySettingsDialog as _SettingsDialog
+        if _ResizableRectItem is None:
+            from dummy_components import DummyResizableRectItem as _ResizableRectItem
+        logger.warning(
+            "Using DUMMY GUI components for Scene, View, Settings, RectItem as needed."
         )
-        from dummy_components import DummySettingsDialog as _SettingsDialog
-        from dummy_components import DummyResizableRectItem as _ResizableRectItem
+    except ImportError as e_dummy_basic_gui:
+        logger.critical(
+            f"CRITICAL: Failed to import required DUMMY Basic GUI components: {e_dummy_basic_gui}"
+        )
+        print(
+            f"[CRITICAL] Cannot load Basic GUI components or dummies: {e_dummy_basic_gui}"
+        )
+        raise ImportError(
+            f"Cannot load Basic GUI components or dummies: {e_dummy_basic_gui}"
+        ) from e_dummy_basic_gui
+
+# Fallback for PRO components (only if needed)
+if _TrainingDashboard is None:
+    try:
         from dummy_components import DummyTrainingDashboard as _TrainingDashboard
 
-        logging.warning("Using DUMMY GUI components from dummy_components.")
-    except ImportError as e_dummy_gui:
-        logging.critical(
-            f"CRITICAL: Failed to import DUMMY GUI components: {e_dummy_gui}"
+        logger.warning(
+            f"Using DUMMY TrainingDashboard (Tier: {getattr(config, 'TIER', 'UNKNOWN')})."
         )
-        print(f"[CRITICAL] Cannot load GUI components or dummies: {e_dummy_gui}")
-        sys.exit(1)  # Exit if essential UI components cannot be loaded
+    except ImportError as e_dummy_pro_gui:
+        logger.error(f"Failed to import DUMMY TrainingDashboard: {e_dummy_pro_gui}")
+# --- TIERING: Fallback for TrainingPipeline ---
+if _TrainingPipeline is None:
+    # We don't directly USE the pipeline class here, but need its NAME for checks
+    # If it failed to import, assume it's the dummy for checks later
+    class _DummyTrainingPipeline:
+        pass  # Minimal dummy just for name check
+
+    _TrainingPipeline = _DummyTrainingPipeline
+    logger.warning(
+        f"Using placeholder _DummyTrainingPipeline for checks (Tier: {getattr(config, 'TIER', 'UNKNOWN')})."
+    )
+
 
 # Assign determined classes (real or dummy) to names used later
 AnnotationScene = _AnnotationScene
 AnnotatorGraphicsView = _AnnotatorGraphicsView
 SettingsDialog = _SettingsDialog
-ResizableRectItem = _ResizableRectItem  # Will be the real or dummy class
+ResizableRectItem = _ResizableRectItem
 TrainingDashboard = _TrainingDashboard
+# --- TIERING: Assign TrainingPipeline class (real or dummy placeholder) ---
+TrainingPipeline = _TrainingPipeline
 
-# Check ResizableRectItem specifically as it caused issues before
-# Use __name__ for comparison as the class object itself might differ
+# Check ResizableRectItem specifically as it's crucial
 if ResizableRectItem.__name__ == "DummyResizableRectItem":
-    logging.warning(
+    logger.warning(
         "Assigned DummyResizableRectItem. Annotation functionality will be limited."
     )
-# Check if the assigned ResizableRectItem is actually a QGraphicsItem subclass (important!)
 elif not issubclass(ResizableRectItem, QGraphicsItem):
-    logging.critical(
-        f"CRITICAL: Imported ResizableRectItem ('{ResizableRectItem.__name__}') is not a QGraphicsItem subclass. Type: {type(ResizableRectItem)}"
+    logger.critical(
+        f"CRITICAL: Imported ResizableRectItem ('{ResizableRectItem.__name__}') is not a QGraphicsItem subclass."
     )
-    # Handle this critical failure - maybe force dummy or exit?
     try:
         from dummy_components import DummyResizableRectItem
 
-        ResizableRectItem = DummyResizableRectItem  # Force dummy
-        logging.critical("Forcing DummyResizableRectItem due to type mismatch.")
+        ResizableRectItem = DummyResizableRectItem
+        logger.critical("Forcing DummyResizableRectItem.")
     except ImportError:
         print("[CRITICAL] Cannot force DummyResizableRectItem. Exiting.")
         sys.exit(1)
-
-logger = logging.getLogger(__name__)
 
 
 class AnnotatorWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Snowball Annotator")
+        # --- TIERING: Use config.TIER set by main.py ---
+        self.current_tier = config.TIER
+        self.setWindowTitle(f"Snowball Annotator [{self.current_tier}]")
         self.setGeometry(100, 100, 1200, 800)
-        self.logger = logger
+        self.logger = logger  # Use module-level logger
         self.state = None
-        self._ml_task_active = False
+        self._ml_task_active = False  # Tracks if *any* blocking task is running
 
         self.graphics_scene = None
         self.graphics_view = None
         self.image_count_label = None
         self.annotated_count_label = None
-        self.auto_box_items = []  # Keep track of suggestion items
+        self.auto_box_items = []
         self.last_box_data = None
-        self.training_dashboard_instance = None  # Added for tracking dashboard
+        self.training_dashboard_instance = None
 
-        # Initialize StateManager
+        # Initialize StateManager (uses the class determined by tier logic via imports)
         try:
-            # Provide default class if needed - gets class_list from StateManager itself if real
-            # Dummy needs explicit list
+            # Dummy needs list, real gets from session/default
             self.state = StateManager(class_list=["Object"])
-            logger.info("StateManager initialized OK.")
+            logger.info(
+                f"StateManager initialized OK (Class: {StateManager.__name__})."
+            )
         except Exception as e:
             logger.exception("CRITICAL FAILURE during StateManager initialization")
             QMessageBox.critical(
@@ -204,24 +298,22 @@ class AnnotatorWindow(QMainWindow):
                 "StateManager Init Error",
                 f"Could not initialize StateManager:\n{e}",
             )
-            # Fallback already handled by import logic, self.state should be the dummy here
+            # If this happens, StateManager should be the dummy already
+            # Check just in case the dummy failed somehow too
             if (
                 not isinstance(self.state, StateManager)
                 or StateManager.__name__ != "_DummyStateManager"
             ):
-                # This case should ideally not happen if import logic is correct
-                logger.critical(
-                    "StateManager instance is unexpectedly not the dummy after init failure."
-                )
                 QMessageBox.critical(
-                    self, "Fatal Error", "Could not initialize any StateManager."
+                    self, "Fatal Error", "Could not initialize ANY StateManager."
                 )
-                sys.exit(1)
+                sys.exit(1)  # Critical failure if even dummy fails
 
         # Initialize Graphics Components
         try:
-            # Pass self (AnnotatorWindow) as parent
+            # Uses class determined above
             self.graphics_scene = AnnotationScene(self)
+            # Uses class determined above
             self.graphics_view = AnnotatorGraphicsView(self.graphics_scene, self)
             logger.info("Graphics Scene & View initialized OK.")
         except Exception as e:
@@ -231,32 +323,15 @@ class AnnotatorWindow(QMainWindow):
             QMessageBox.critical(
                 self, "UI Init Error", f"Could not initialize graphics components:\n{e}"
             )
-            # Try to continue with dummy components if possible, otherwise exit
+            # Check if we fell back to dummy scene; if not, exit
             if AnnotationScene.__name__ == "DummyAnnotationScene":
                 logger.warning("Falling back to dummy graphics components.")
             else:
-                sys.exit(1)
+                sys.exit(1)  # Exit if real graphics failed and no dummy available
 
         # Initialize UI Layout and Widgets
         try:
-            self.initUI()
-            # Basic checks after UI init
-            if not getattr(self, "image_count_label", None):
-                logger.critical(
-                    "!!! UI INIT FAILURE: image_count_label not created !!!"
-                )
-            if not getattr(self, "annotated_count_label", None):
-                logger.critical(
-                    "!!! UI INIT FAILURE: annotated_count_label not created !!!"
-                )
-            if not getattr(self, "export_model_action", None):
-                logger.critical(
-                    "!!! UI INIT FAILURE: export_model_action not created !!!"
-                )
-            if not getattr(self, "force_mini_train_button", None):
-                logger.critical(
-                    "!!! UI INIT FAILURE: force_mini_train_button not created !!!"
-                )
+            self.initUI()  # UI setup will now check self.current_tier
             logger.info("initUI completed.")
         except Exception as init_ui_err:
             logger.critical(
@@ -272,33 +347,42 @@ class AnnotatorWindow(QMainWindow):
         # Connect StateManager Signals
         if self.state:
             try:
-                # Check signal existence before connecting
+                # Connect signals that exist on BOTH real and dummy
                 if hasattr(self.state, "task_running"):
                     self.state.task_running.connect(self.on_ml_task_running_changed)
                 if hasattr(self.state, "settings_changed"):
                     self.state.settings_changed.connect(self.handle_settings_changed)
-                # Prediction signals
+                # Progress/error signals MIGHT exist on dummy
                 if hasattr(self.state, "prediction_progress"):
                     self.state.prediction_progress.connect(self.update_status)
-                if hasattr(self.state, "prediction_finished"):
-                    # Connect to the updated handler for suggestions
-                    self.state.prediction_finished.connect(
-                        self.handle_prediction_results
-                    )
                 if hasattr(self.state, "prediction_error"):
                     self.state.prediction_error.connect(self.handle_task_error)
-                # Training signals
                 if hasattr(self.state, "training_progress"):
                     self.state.training_progress.connect(self.update_status)
-                if hasattr(self.state, "training_run_completed"):
-                    self.state.training_run_completed.connect(
-                        self.handle_training_run_completed
-                    )  # Connect completion
                 if hasattr(self.state, "training_error"):
                     self.state.training_error.connect(self.handle_task_error)
-                logger.debug(
-                    "StateManager signals connected OK (or skipped missing ones)."
-                )
+
+                # --- TIERING: Connect PRO-only signals conditionally ---
+                if self.current_tier == "PRO":
+                    if hasattr(self.state, "prediction_finished"):
+                        self.state.prediction_finished.connect(
+                            self.handle_prediction_results
+                        )
+                        logger.debug("[PRO] Connected prediction_finished signal.")
+                    else:
+                        logger.warning(
+                            "[PRO] StateManager missing prediction_finished signal."
+                        )
+                    if hasattr(self.state, "training_run_completed"):
+                        self.state.training_run_completed.connect(
+                            self.handle_training_run_completed
+                        )
+                        logger.debug("[PRO] Connected training_run_completed signal.")
+                    else:
+                        logger.warning(
+                            "[PRO] StateManager missing training_run_completed signal."
+                        )
+                logger.debug("StateManager signals connected OK (respecting tier).")
             except Exception as sig_err:
                 logger.error(
                     f"Error connecting StateManager signals: {sig_err}", exc_info=True
@@ -313,54 +397,64 @@ class AnnotatorWindow(QMainWindow):
                 "CRITICAL: No StateManager instance available for signal connection."
             )
 
+        # Connect Scene Signals (should exist on real/dummy)
+        if self.graphics_scene and hasattr(self.graphics_scene, "annotationsModified"):
+            self.graphics_scene.annotationsModified.connect(
+                self.handle_scene_modification
+            )
+        else:
+            logger.warning("Cannot connect scene annotationsModified signal.")
+
         # Initial UI State
         if hasattr(self, "bbox_tool_button"):
-            self.set_tool_active("bbox")  # Default tool
+            self.set_tool_active("bbox")
         self.update_status("Ready. Load directory or session.")
         self._update_image_count_label()
         self._update_annotated_count_label()
-        # Set initial enabled states based on whether a task might be running (should be false)
+        # Set initial enabled state based on whether a task might be running (unlikely at init)
         self.on_ml_task_running_changed(
             self.state.is_task_active()
             if self.state and hasattr(self.state, "is_task_active")
             else False
         )
 
-        # Set initial confidence value if possible
-        if self.state:
+        # Set initial confidence value (Pro relevant)
+        # Only do this if the spinbox actually exists (i.e., was created in initUI)
+        if hasattr(self, "confidence_spinbox"):
             try:
                 conf_key = config.SETTING_KEYS.get("confidence_threshold")
                 conf_default = config.DEFAULT_CONFIDENCE_THRESHOLD
-                # Use getattr for safety, check if key exists
                 conf = (
                     self.state.get_setting(conf_key, conf_default)
-                    if conf_key and hasattr(self.state, "get_setting")
+                    if self.state and conf_key and hasattr(self.state, "get_setting")
                     else conf_default
                 )
-                if hasattr(self, "confidence_spinbox"):
-                    # Ensure value is within spinbox range before setting
-                    conf_percent = int(conf * 100)
-                    min_val = self.confidence_spinbox.minimum()
-                    max_val = self.confidence_spinbox.maximum()
-                    clamped_val = max(min_val, min(conf_percent, max_val))
-                    self.confidence_spinbox.setValue(clamped_val)
+                conf_percent = int(conf * 100)
+                min_val, max_val = (
+                    self.confidence_spinbox.minimum(),
+                    self.confidence_spinbox.maximum(),
+                )
+                self.confidence_spinbox.setValue(
+                    max(min_val, min(conf_percent, max_val))
+                )
             except Exception as e:
                 logger.error(f"Failed to set initial confidence spinbox value: {e}")
 
-        # --- FIX: Connect confidence spinbox valueChanged signal ---
-        if hasattr(self, "confidence_spinbox"):
+        # Connect confidence spinbox signal (Pro relevant)
+        # Connect only if PRO tier and the widget exists
+        if hasattr(self, "confidence_spinbox") and self.current_tier == "PRO":
             self.confidence_spinbox.valueChanged.connect(
                 self.on_confidence_spinbox_changed
             )
-            logger.debug("Connected confidence_spinbox valueChanged signal.")
-        # --- END FIX ---
+            logger.debug("[PRO] Connected confidence_spinbox valueChanged signal.")
 
         # Clear image if none loaded
         if isinstance(self.graphics_scene, AnnotationScene):
-            current_img_exists = False
-            if self.state and hasattr(self.state, "get_current_image"):
-                current_img_exists = bool(self.state.get_current_image())
-
+            current_img_exists = (
+                bool(self.state.get_current_image())
+                if self.state and hasattr(self.state, "get_current_image")
+                else False
+            )
             if not current_img_exists:
                 try:
                     self.graphics_scene.set_image(None)
@@ -371,8 +465,10 @@ class AnnotatorWindow(QMainWindow):
         elif AnnotationScene.__name__ == "DummyAnnotationScene":
             logger.warning("Skipping initial scene clear - using dummy scene.")
 
-        logger.info("AnnotatorWindow initialization complete.")
-        print("--- AnnotatorWindow Initialized ---")
+        logger.info(
+            f"AnnotatorWindow initialization complete for Tier: {self.current_tier}."
+        )
+        print(f"--- AnnotatorWindow Initialized [{self.current_tier}] ---")
 
     # --- Methods ---
 
@@ -381,16 +477,32 @@ class AnnotatorWindow(QMainWindow):
         widget = getattr(self, widget_attr_name, None)
         if widget and hasattr(widget, "setEnabled"):
             try:
-                widget.setEnabled(enabled_state)
+                widget.setEnabled(bool(enabled_state))  # Ensure boolean
             except Exception as e:
                 logger.error(f"Error setting enabled state for {widget_attr_name}: {e}")
+        elif not widget:
+            # Don't log error if widget just doesn't exist (Pro widget in Basic)
+            # Check if it's expected for the current tier before logging debug
+            is_pro_widget = widget_attr_name in [
+                "auto_group",
+                "auto_box_button",
+                "confidence_spinbox",
+                "force_mini_train_button",
+                "training_dashboard_button",
+                "export_model_action",
+            ]
+            if is_pro_widget and self.current_tier != "PRO":
+                pass  # Expected missing widget in Basic tier
+            else:
+                logger.debug(
+                    f"Widget not found for set_enabled_safe: {widget_attr_name}"
+                )
 
     def _update_image_count_label(self):
         """Updates the image count label (e.g., 'Image 5 / 100')."""
         count_label = getattr(self, "image_count_label", None)
         if not count_label:
             return
-
         current_num_str, total_num_str = "-", "-"
         if (
             self.state
@@ -407,79 +519,59 @@ class AnnotatorWindow(QMainWindow):
                 ):
                     current_num_str = str(self.state.current_index + 1)
                 else:
-                    current_num_str = "0" if total_num == 0 else "?"
-            except TypeError:
-                logger.warning("State.image_list is not iterable for count label.")
-                total_num_str = "Err"
-            except Exception as e:
-                logger.error(f"Error updating image count label state access: {e}")
-                total_num_str = "Err"
-
+                    current_num_str = (
+                        "0" if total_num == 0 else "?"
+                    )  # Handle empty list or invalid index
+            except Exception:
+                total_num_str = "Err"  # Handle potential errors gracefully
+        # Check if using dummy state manager
         is_dummy = StateManager.__name__ == "_DummyStateManager"
         label_text = f"Image {current_num_str} / {total_num_str}"
         if is_dummy:
-            label_text += " (Dummy)"
-
+            label_text += " (Dummy State)"
         count_label.setText(label_text)
 
     def _update_annotated_count_label(self):
-        """Updates the annotated count label (e.g., 'Annotated: 25')."""
+        """Updates the annotated count label (e.g., 'Approved: 25')."""
         count_label = getattr(self, "annotated_count_label", None)
         if not count_label:
             return
-
         annotated_num_str = "-"
         if self.state and hasattr(self.state, "approved_count"):
             is_dummy = StateManager.__name__ == "_DummyStateManager"
-            if is_dummy:
-                annotated_num_str = f"{self.state.approved_count} (Dummy)"
-            else:
-                try:
-                    count_val = self.state.approved_count
-                    if isinstance(count_val, int):
-                        annotated_num_str = str(count_val)
-                    elif count_val is None:
-                        annotated_num_str = "0"
-                        logger.debug("state.approved_count was None, displaying '0'.")
-                    else:
-                        annotated_num_str = "Invalid"
-                        logger.warning(
-                            f"Unexpected type for state.approved_count: {type(count_val)}"
-                        )
-                except AttributeError:
-                    annotated_num_str = "Error"
-                    logger.error(
-                        "Attribute 'approved_count' not found on StateManager instance."
-                    )
-                except Exception as e:
-                    annotated_num_str = "Error"
-                    logger.error(
-                        f"Error accessing state.approved_count: {e}", exc_info=True
-                    )
-
-        count_label.setText(f"Annotated: {annotated_num_str}")
+            try:
+                count_val = self.state.approved_count
+                if isinstance(count_val, int):
+                    annotated_num_str = str(count_val)
+                elif count_val is None:
+                    annotated_num_str = "0"  # Assume 0 if None
+                else:
+                    annotated_num_str = "Invalid"
+                if is_dummy:
+                    annotated_num_str += " (Dummy)"
+            except Exception:
+                annotated_num_str = "Error"
+        count_label.setText(f"Approved: {annotated_num_str}")
 
     def initUI(self):
-        """Initializes the main UI layout and widgets."""
+        """Initializes the main UI layout and widgets, respecting tier."""
         print("--- Starting initUI ---")
         central_widget = QWidget()
         main_layout = QVBoxLayout(central_widget)
         main_layout.setContentsMargins(8, 8, 8, 8)
         main_layout.setSpacing(10)
 
-        # --- Left Panel Setup ---
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(10, 10, 10, 10)
         left_layout.setSpacing(8)
 
-        # --- Controls Group ---
         controls_group = QGroupBox("Controls")
         controls_layout = QVBoxLayout(controls_group)
         controls_layout.setContentsMargins(5, 8, 5, 8)
         controls_layout.setSpacing(5)
 
-        # --- Tools Group (BBox button) ---
+        # --- Tools Group (Basic & Pro) ---
         tool_group = QGroupBox("Tools")
         tool_layout = QHBoxLayout(tool_group)
         tool_layout.setContentsMargins(5, 5, 5, 5)
@@ -495,12 +587,13 @@ class AnnotatorWindow(QMainWindow):
         tool_layout.addWidget(self.bbox_tool_button)
         controls_layout.addWidget(tool_group)
 
-        # --- Main Buttons Stack ---
+        # --- Main Buttons Stack (Create all, hide/disable later) ---
         btn_stack_widget = QWidget()
         btn_stack_layout = QVBoxLayout(btn_stack_widget)
         btn_stack_layout.setContentsMargins(0, 0, 0, 0)
         btn_stack_layout.setSpacing(8)
 
+        # Basic Buttons
         self.load_button = QPushButton("Load Image Directory")
         self.load_button.setToolTip("Load all images from a selected folder")
         self.load_button.clicked.connect(self.load_directory)
@@ -536,16 +629,17 @@ class AnnotatorWindow(QMainWindow):
         self.manage_classes_button.clicked.connect(self.manage_classes)
         btn_stack_layout.addWidget(self.manage_classes_button)
 
-        self.force_mini_train_button = QPushButton("Force Mini-Train")
+        # Pro Buttons (Create them here, add [PRO] suffix for clarity)
+        self.force_mini_train_button = QPushButton("Force Mini-Train [PRO]")
         self.force_mini_train_button.setToolTip(
-            "Manually trigger training using the '20 image' parameters (requires >0 approved images)"
+            "[PRO] Manually trigger training using '20 image' parameters"
         )
         self.force_mini_train_button.clicked.connect(self.force_mini_training)
         btn_stack_layout.addWidget(self.force_mini_train_button)
 
-        self.training_dashboard_button = QPushButton("Training Dashboard")
+        self.training_dashboard_button = QPushButton("Training Dashboard [PRO]")
         self.training_dashboard_button.setToolTip(
-            "Open the training dashboard to view stats and graphs."
+            "[PRO] Open dashboard for training stats and settings"
         )
         self.training_dashboard_button.clicked.connect(self.open_training_dashboard)
         btn_stack_layout.addWidget(self.training_dashboard_button)
@@ -553,72 +647,63 @@ class AnnotatorWindow(QMainWindow):
         controls_layout.addWidget(btn_stack_widget)
         left_layout.addWidget(controls_group)
 
-        # --- Info Labels ---
+        # --- Info Labels (Basic & Pro) ---
         self.image_count_label = QLabel("Image - / -")
         self.image_count_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         left_layout.addWidget(self.image_count_label)
-        self.annotated_count_label = QLabel("Annotated: -")
+        self.annotated_count_label = QLabel("Approved: -")
         self.annotated_count_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         left_layout.addWidget(self.annotated_count_label)
 
-        # --- Auto Annotation Group ---
-        auto_group = QGroupBox("Auto Annotation")
-        auto_layout = QVBoxLayout(auto_group)
+        # --- Auto Annotation Group (Create all UI, hide/disable later) ---
+        self.auto_group = QGroupBox("Auto Annotation [PRO]")  # Add [PRO] suffix
+        auto_layout = QVBoxLayout(self.auto_group)
         auto_layout.setContentsMargins(5, 8, 5, 8)
         auto_layout.setSpacing(5)
         self.auto_box_button = QCheckBox("Show Suggestions")
         self.auto_box_button.setToolTip(
-            "Show AI-generated bounding box suggestions (Double-click suggestion to accept)"
+            "[PRO] Show AI suggestions (Double-click to accept)"
         )
         self.auto_box_button.toggled.connect(self.toggle_auto_boxes)
         auto_layout.addWidget(self.auto_box_button)
 
-        conf_layout = QHBoxLayout()
+        self.conf_layout_widget = QWidget()  # Widget to hold label+spinbox
+        conf_layout = QHBoxLayout(self.conf_layout_widget)
+        conf_layout.setContentsMargins(0, 0, 0, 0)
         conf_layout.addWidget(QLabel("Confidence:"))
         self.confidence_spinbox = QSpinBox()
         self.confidence_spinbox.setRange(0, 100)
         self.confidence_spinbox.setSuffix("%")
         self.confidence_spinbox.setToolTip(
-            "Minimum confidence for suggestions (0-100%)"
+            "[PRO] Minimum confidence for suggestions (0-100%)"
         )
         try:
             default_conf = config.DEFAULT_CONFIDENCE_THRESHOLD
             self.confidence_spinbox.setValue(int(default_conf * 100))
-        except Exception as e:
-            logger.error(f"Error setting default confidence spinbox value: {e}")
+        except Exception:
             self.confidence_spinbox.setValue(25)
+        # Connect valueChanged signal in __init__ after spinbox is created
         conf_layout.addWidget(self.confidence_spinbox)
-        auto_layout.addLayout(conf_layout)
-        left_layout.addWidget(auto_group)
-
-        # --- FIX: Connection is now in __init__ after this method runs ---
-        # self.confidence_spinbox.valueChanged.connect(self.on_confidence_spinbox_changed)
-        # --- END FIX ---
+        auto_layout.addWidget(self.conf_layout_widget)  # Add inner widget
+        left_layout.addWidget(self.auto_group)  # Add the group to the main layout
 
         left_layout.addStretch(1)
 
-        # --- Graphics View Setup ---
+        # --- Graphics View Setup (Basic & Pro) ---
         if not self.graphics_view:
             logger.critical("!!! graphics_view is None during initUI !!!")
-            # Create a dummy widget to avoid crashing the layout if view init failed
-            self.graphics_view = QWidget()
-            QMessageBox.critical(
-                self,
-                "UI Error",
-                "Graphics view component failed to initialize correctly.",
-            )
+            self.graphics_view = QWidget()  # Dummy to prevent crash
         else:
             self.graphics_view.setMinimumWidth(400)
 
-        # --- Splitter Setup ---
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(left_panel)
         splitter.addWidget(self.graphics_view)
-        splitter.setStretchFactor(0, 0)  # Left panel fixed size initially
-        splitter.setStretchFactor(1, 1)  # Graphics view takes available space
-        splitter.setSizes([260, 640])  # Initial size distribution
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([260, 640])
 
-        # --- Bottom Layout (Approve Button) ---
+        # --- Bottom Layout (Approve Button - Basic & Pro) ---
         bottom_layout = QHBoxLayout()
         bottom_layout.addStretch(1)
         self.approve_button = QPushButton("Approve && Next Unannotated")
@@ -626,136 +711,190 @@ class AnnotatorWindow(QMainWindow):
             "background-color: lightgreen; padding: 5px; font-weight: bold;"
         )
         self.approve_button.setToolTip(
-            "Mark current image annotations as reviewed and move to the next unannotated image"
+            "Mark current annotations as reviewed and move to the next unannotated image"
         )
         self.approve_button.clicked.connect(self.approve_image)
         bottom_layout.addWidget(self.approve_button)
 
-        # --- Add Major Components to Main Layout ---
-        main_layout.addWidget(splitter, 1)  # Splitter takes most space
+        main_layout.addWidget(splitter, 1)
         main_layout.addLayout(bottom_layout)
-
         self.setCentralWidget(central_widget)
 
-        # --- Status Bar ---
         self.status_bar = self.statusBar()
         self.status_label = QLabel("Initializing...")
         self.status_bar.addWidget(self.status_label)
 
-        # --- Menu Bar ---
+        # --- Menu Bar (Create all actions, hide/disable later) ---
         menubar = self.menuBar()
         file_menu = menubar.addMenu("&File")
 
+        # Basic Actions
         self.load_dir_action = QAction("Load Directory", self)
         self.load_dir_action.setShortcut("Ctrl+O")
         self.load_dir_action.triggered.connect(self.load_directory)
         file_menu.addAction(self.load_dir_action)
-
         self.load_sess_action = QAction("Load Session", self)
         self.load_sess_action.setShortcut("Ctrl+L")
         self.load_sess_action.triggered.connect(self.load_session_explicitly)
         file_menu.addAction(self.load_sess_action)
-
         self.save_sess_action = QAction("Save Session", self)
         self.save_sess_action.setShortcut("Ctrl+S")
         self.save_sess_action.triggered.connect(self.save_session)
         file_menu.addAction(self.save_sess_action)
-
         file_menu.addSeparator()
 
-        self.export_model_action = QAction("Export Trained Model...", self)
-        self.export_model_action.setToolTip(
-            "Save the latest trained model (.pt) to a location of your choice"
-        )
+        # Pro Action (Create it, add [PRO] suffix)
+        self.export_model_action = QAction("Export Trained Model [PRO]...", self)
+        self.export_model_action.setToolTip("[PRO] Save the latest trained model (.pt)")
         self.export_model_action.triggered.connect(self.export_model)
         file_menu.addAction(self.export_model_action)
 
+        # Basic Action
         self.export_data_action = QAction("Export Annotated Data (YOLO)...", self)
         self.export_data_action.setToolTip(
-            "Export approved annotations and images in YOLO format to a folder"
+            "Export approved annotations/images in YOLO format"
         )
         self.export_data_action.triggered.connect(self.export_annotated_data)
         file_menu.addAction(self.export_data_action)
 
         file_menu.addSeparator()
-
         self.settings_action = QAction("Legacy Settings...", self)
         self.settings_action.triggered.connect(self.open_settings_dialog)
         file_menu.addAction(self.settings_action)
-
         file_menu.addSeparator()
-
         exit_action = QAction("Exit", self)
         exit_action.setShortcut("Ctrl+Q")
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
 
+        # --- APPLY TIER RESTRICTIONS ---
+        self._apply_tier_restrictions()  # Call helper function
+
         print("--- Finished initUI ---")
 
-    # --- FIX: Add the slot method to handle the signal ---
+    def _apply_tier_restrictions(self):
+        """Hides or disables UI elements based on self.current_tier."""
+        is_pro = self.current_tier == "PRO"
+        logger.info(
+            f"Applying UI restrictions for Tier: {self.current_tier} (Is Pro: {is_pro})"
+        )
+
+        # Find widgets safely using getattr
+        auto_group_widget = getattr(self, "auto_group", None)
+        force_train_btn = getattr(self, "force_mini_train_button", None)
+        train_dash_btn = getattr(self, "training_dashboard_button", None)
+        export_model_act = getattr(self, "export_model_action", None)
+        auto_box_btn = getattr(self, "auto_box_button", None)
+        conf_spinbox = getattr(self, "confidence_spinbox", None)
+        conf_layout_widget = getattr(
+            self, "conf_layout_widget", None
+        )  # Get the layout holder too
+
+        # Hide/Show entire sections or specific buttons/actions
+        if auto_group_widget:
+            auto_group_widget.setVisible(is_pro)
+        if force_train_btn:
+            force_train_btn.setVisible(is_pro)
+        if train_dash_btn:
+            train_dash_btn.setVisible(is_pro)
+        if export_model_act:
+            export_model_act.setVisible(is_pro)
+
+        # Also set enabled state (might be redundant if hidden, but good practice)
+        self.set_enabled_safe("auto_box_button", is_pro)
+        # self.set_enabled_safe("confidence_spinbox", is_pro) # Enabled state depends on checkbox
+        self.set_enabled_safe("force_mini_train_button", is_pro)
+        self.set_enabled_safe("training_dashboard_button", is_pro)
+        if export_model_act:
+            export_model_act.setEnabled(is_pro)
+
+        # Ensure checkbox is off if not Pro
+        if auto_box_btn and not is_pro:
+            auto_box_btn.setChecked(False)
+
+        # Update confidence spinbox enabled state based on checkbox (if Pro)
+        # Also enable/disable the layout holder for visual consistency
+        if conf_spinbox and auto_box_btn:
+            is_conf_enabled = is_pro and auto_box_btn.isChecked()
+            conf_spinbox.setEnabled(is_conf_enabled)
+            if conf_layout_widget:
+                conf_layout_widget.setEnabled(is_conf_enabled)
+
+        logger.info("Finished applying tier restrictions to UI.")
+
+    # --- Scene Modification Slot ---
+    @pyqtSlot()
+    def handle_scene_modification(self):
+        """Handles signal that annotations were modified in the scene."""
+        logger.debug("Scene annotations modified by user interaction.")
+        # Could potentially enable the save button here
+
     @pyqtSlot(int)
     def on_confidence_spinbox_changed(self, value: int):
-        """Slot to update confidence threshold setting when spinbox changes."""
+        """Updates confidence threshold setting (PRO ONLY)."""
+        # --- TIER CHECK ---
+        if self.current_tier != "PRO":
+            # This shouldn't be called if basic, but check anyway
+            logger.warning("[BASIC] on_confidence_spinbox_changed called unexpectedly.")
+            return
+        # --- END TIER CHECK ---
+
         is_dummy_state = StateManager.__name__ == "_DummyStateManager"
         if not self.state or is_dummy_state:
-            return  # Do nothing if state manager is unavailable
+            return  # Ignore if dummy
 
         conf_key = config.SETTING_KEYS.get("confidence_threshold")
         if conf_key and hasattr(self.state, "set_setting"):
             try:
-                # Convert percentage (0-100) to float (0.0-1.0)
                 new_threshold_float = float(value) / 100.0
-                # Call StateManager to update the setting
                 self.state.set_setting(conf_key, new_threshold_float)
-                # Optionally update status bar, but might be too noisy
-                # self.update_status(f"Confidence threshold set to {value}%")
                 logger.debug(
-                    f"Confidence threshold setting updated to {new_threshold_float:.2f} ({value}%)"
+                    f"[PRO] Confidence threshold setting updated to {new_threshold_float:.2f} ({value}%)"
                 )
+                # No need to re-trigger prediction here, happens when checkbox is toggled or image loaded
             except Exception as e:
                 logger.error(f"Error updating confidence setting from spinbox: {e}")
         else:
             logger.error(
-                "Cannot update confidence: Setting key or set_setting method missing."
+                "Cannot update confidence: Setting key or set_setting missing."
             )
-
-    # --- END FIX ---
 
     def set_tool_active(self, tool_name):
         """Sets the active tool in the graphics scene."""
         logger.debug(f"Set tool requested: {tool_name}")
         scene = getattr(self, "graphics_scene", None)
+        # Check if it's the *real* AnnotationScene
         if isinstance(scene, AnnotationScene) and hasattr(scene, "set_tool"):
             if tool_name == "bbox":
                 scene.set_tool(tool_name)
                 btn = getattr(self, "bbox_tool_button", None)
                 if btn and not btn.isChecked():
-                    btn.setChecked(True)  # Ensure button state matches
+                    btn.setChecked(True)
                 self.update_status("Tool: Draw BBox")
+            # Add other tools here if needed
+            # elif tool_name == "select":
+            #     scene.set_tool(tool_name)
+            #     # Update button states if you add a select tool button
+            #     self.update_status("Tool: Select/Modify")
             else:
-                logger.warning(
-                    f"Unhandled tool name: {tool_name}, reverting to 'bbox'."
-                )
-                scene.set_tool("bbox")
+                logger.warning(f"Unhandled tool: {tool_name}, reverting.")
+                scene.set_tool("bbox")  # Default back to bbox
                 btn = getattr(self, "bbox_tool_button", None)
                 if btn and not btn.isChecked():
                     btn.setChecked(True)
                 self.update_status("Tool: Reverted to BBox Tool")
         else:
-            logger.error(
-                f"Cannot set tool: Graphics scene is invalid or dummy ({type(scene)})."
-            )
-            # Ensure button state reflects failure
+            # Log error if scene is invalid or the dummy scene
+            logger.error(f"Cannot set tool: Scene invalid/dummy ({type(scene)}).")
             btn = getattr(self, "bbox_tool_button", None)
             if btn:
-                btn.setChecked(False)
+                btn.setChecked(False)  # Uncheck button if scene is bad
 
     def paste_last_box(self):
-        """Pastes the last approved bounding box onto the center of the current image."""
+        """Pastes last approved box (Basic & Pro)."""
         logger.debug("Paste last box requested (centered).")
         scene = getattr(self, "graphics_scene", None)
-
-        # Check if scene is valid and has an image displayed
+        # Check if it's the real scene and has a valid image
         scene_is_valid = (
             isinstance(scene, AnnotationScene)
             and hasattr(scene, "image_item")
@@ -765,136 +904,105 @@ class AnnotatorWindow(QMainWindow):
 
         if self.last_box_data and scene_is_valid:
             try:
-                # Get data stored during approve_image
-                stored_rect_scene_coords = self.last_box_data.get("rect")
+                stored_rect = self.last_box_data.get("rect")
                 class_label = self.last_box_data.get("class")
-
-                # Validate stored data structure
-                if not isinstance(stored_rect_scene_coords, QRectF) or not class_label:
-                    logger.warning(
-                        "Invalid last_box_data structure for pasting (expected scene QRectF)."
-                    )
-                    self.update_status("Paste failed: Invalid stored data.")
+                if not isinstance(stored_rect, QRectF) or not class_label:
+                    logger.warning("Invalid last_box_data format.")
                     return
 
-                # Validate stored size
-                width = stored_rect_scene_coords.width()
-                height = stored_rect_scene_coords.height()
+                width, height = stored_rect.width(), stored_rect.height()
                 if width <= 0 or height <= 0:
-                    logger.warning(
-                        f"Invalid size in last_box_data for pasting: {width}x{height}"
-                    )
-                    self.update_status("Paste failed: Invalid stored size.")
-                    return
-                logger.debug(
-                    f"--- Paste Debug: Stored Size = {width}x{height}, Class = {class_label}"
-                )
-
-                # Get current image boundaries in scene coordinates
-                current_scene_rect = scene.image_item.sceneBoundingRect()
-                logger.debug(
-                    f"--- Paste Debug: Current Image Scene Rect = {current_scene_rect}"
-                )
-                if not current_scene_rect.isValid() or current_scene_rect.isEmpty():
-                    logger.warning(
-                        "Cannot paste: Current scene rectangle is invalid or empty."
-                    )
-                    self.update_status("Paste failed: Scene invalid.")
+                    logger.warning(f"Invalid size in last_box_data: {width}x{height}")
                     return
 
-                # Calculate center position
-                center_x = current_scene_rect.center().x()
-                center_y = current_scene_rect.center().y()
-                logger.debug(
-                    f"--- Paste Debug: Scene Center = ({center_x}, {center_y})"
-                )
+                # Get current image scene rect
+                current_rect = scene.image_item.sceneBoundingRect()
+                if not current_rect.isValid() or current_rect.isEmpty():
+                    logger.warning("Cannot paste: Scene rect invalid.")
+                    return
 
-                # Calculate desired top-left based on center and stored size
+                # Calculate center and new top-left
+                center_x = current_rect.center().x()
+                center_y = current_rect.center().y()
                 paste_x = center_x - (width / 2.0)
                 paste_y = center_y - (height / 2.0)
-                logger.debug(
-                    f"--- Paste Debug: Calculated Top-Left (Pre-Clamp) = ({paste_x}, {paste_y})"
-                )
 
-                # Clamp the position to stay within the image boundaries
-                paste_x_clamped = max(
-                    current_scene_rect.left(),
-                    min(paste_x, current_scene_rect.right() - width),
+                # Clamp position to be within image boundaries
+                paste_x_c = max(
+                    current_rect.left(), min(paste_x, current_rect.right() - width)
                 )
-                paste_y_clamped = max(
-                    current_scene_rect.top(),
-                    min(paste_y, current_scene_rect.bottom() - height),
+                paste_y_c = max(
+                    current_rect.top(), min(paste_y, current_rect.bottom() - height)
                 )
-                # Re-clamp just in case width/height calculation pushed it slightly out
-                paste_x_clamped = max(current_scene_rect.left(), paste_x_clamped)
-                paste_y_clamped = max(current_scene_rect.top(), paste_y_clamped)
+                # Ensure it doesn't go past left/top edge if size makes it impossible
+                paste_x_c = max(current_rect.left(), paste_x_c)
+                paste_y_c = max(current_rect.top(), paste_y_c)
 
-                logger.debug(
-                    f"--- Paste Debug: Calculated Top-Left (Post-Clamp) = ({paste_x_clamped}, {paste_y_clamped})"
-                )
+                new_rect = QRectF(paste_x_c, paste_y_c, width, height)
 
-                # Create the new rectangle in scene coordinates
-                new_rect_scene = QRectF(paste_x_clamped, paste_y_clamped, width, height)
-                logger.debug(
-                    f"--- Paste Debug: Final New Scene Rect for Item = {new_rect_scene}"
+                # Check if using Dummy ResizableRectItem
+                rect_item_class = (
+                    ResizableRectItem  # Use the assigned class (real or dummy)
                 )
-
-                # Ensure we have the correct class for the rectangle item
-                rect_item_class = ResizableRectItem
                 if rect_item_class.__name__ == "DummyResizableRectItem":
-                    logger.error("Cannot paste: ResizableRectItem class is the dummy.")
-                    self.update_status("Paste failed: Internal UI error.")
+                    logger.error("Cannot paste: Using DummyResizableRectItem.")
                     return
 
-                # Create and add the item (as a regular annotation, not suggestion)
-                item = rect_item_class(new_rect_scene, class_label, is_suggestion=False)
+                # Create and add the new item
+                item = rect_item_class(new_rect, class_label, is_suggestion=False)
                 scene.addItem(item)
-                logger.info(
-                    f"Pasted box: {class_label} at scene coords {new_rect_scene}"
-                )
-
-                # Optionally select the new item
-                item.setSelected(True)
+                item.setSelected(True)  # Select the newly pasted item
+                logger.info(f"Pasted box: {class_label} at {new_rect}")
                 self.update_status(f"Pasted box: {class_label} (centered)")
+                if hasattr(scene, "annotationsModified"):
+                    scene.annotationsModified.emit()  # Signal modification
 
             except Exception as e:
                 logger.error(f"Error pasting last box: {e}", exc_info=True)
                 self.update_status("Paste failed.")
         elif not self.last_box_data:
-            logger.warning("Paste last box failed: No box data stored.")
+            logger.warning("Paste failed: No box data stored.")
             self.update_status("Paste failed: No previous box.")
         else:  # Scene not valid
-            logger.warning("Paste last box failed: Scene or image not ready.")
+            logger.warning("Paste failed: Scene or image not ready.")
             self.update_status("Paste failed: Load image first.")
 
     def open_settings_dialog(self):
-        """Opens the legacy settings dialog."""
-        is_dummy_state = StateManager.__name__ == "_DummyStateManager"
-        if not self.state or is_dummy_state:
+        """Opens legacy settings dialog (Basic & Pro)."""
+        if not self.state:
             QMessageBox.warning(
-                self, "Error", "Settings unavailable (State Manager missing or dummy)."
+                self, "Error", "Settings unavailable (State Manager missing)."
             )
             return
 
-        dlg_class = SettingsDialog
+        dlg_class = SettingsDialog  # Use assigned class (real or dummy)
         if dlg_class.__name__ == "DummySettingsDialog":
             QMessageBox.warning(
-                self, "UI Error", "SettingsDialog unavailable (using dummy component)."
+                self, "UI Error", "Settings unavailable (dummy component)."
             )
             return
 
         try:
-            # Pass the state manager and parent window
+            # Pass the state manager instance to the dialog
             dlg = dlg_class(self.state, self)
-            dlg.exec()  # Blocks until dialog is closed
+            dlg.exec()  # Show modally
         except Exception as e:
-            logger.exception("Legacy Settings dialog failed to open or execute")
-            QMessageBox.critical(
-                self, "Dialog Error", f"Error opening legacy settings:\n{e}"
-            )
+            logger.exception("Legacy Settings dialog failed")
+            QMessageBox.critical(self, "Dialog Error", f"Error opening settings: {e}")
 
     def open_training_dashboard(self):
-        """Opens the training dashboard dialog non-modally."""
+        """Opens training dashboard dialog (PRO ONLY)."""
+        # --- TIER CHECK ---
+        if self.current_tier != "PRO":
+            QMessageBox.information(
+                self,
+                "Feature Unavailable",
+                "The Training Dashboard requires the Pro tier.",
+            )
+            logger.warning("[BASIC] Attempted to open Training Dashboard.")
+            return
+        # --- END TIER CHECK ---
+
         is_dummy_state = StateManager.__name__ == "_DummyStateManager"
         if not self.state or is_dummy_state:
             QMessageBox.warning(
@@ -902,41 +1010,48 @@ class AnnotatorWindow(QMainWindow):
             )
             return
 
-        dashboard_class = TrainingDashboard
+        dashboard_class = TrainingDashboard  # Use assigned class (real or dummy)
         if dashboard_class.__name__ == "DummyTrainingDashboard":
             QMessageBox.warning(
                 self, "Error", "Dashboard unavailable (using dummy component)."
             )
             return
 
-        # Check if an instance already exists
+        # Prevent opening multiple instances
         if self.training_dashboard_instance is not None:
             logger.info("Training dashboard already open. Activating.")
-            self.training_dashboard_instance.raise_()  # Bring to front
-            self.training_dashboard_instance.activateWindow()  # Give focus
+            self.training_dashboard_instance.raise_()
+            self.training_dashboard_instance.activateWindow()
             return
 
-        # Create and show the dashboard
         try:
-            dlg = dashboard_class(self.state, self)  # Pass state manager and parent
+            dlg = dashboard_class(self.state, self)
             self.training_dashboard_instance = dlg  # Store reference
-            # Connect finished signal to clear the instance reference when closed
+            # Connect finished signal to clear the reference when closed
             dlg.finished.connect(self.clear_dashboard_instance)
             dlg.show()  # Show non-modally
         except Exception as e:
-            logger.exception("Training dashboard failed to open or show")
-            QMessageBox.critical(
-                self, "Dialog Error", f"Error opening training dashboard:\n{e}"
-            )
-            self.training_dashboard_instance = None  # Ensure cleared on error
+            logger.exception("Training dashboard failed to open")
+            QMessageBox.critical(self, "Dialog Error", f"Error opening dashboard:\n{e}")
+            self.training_dashboard_instance = None  # Clear ref on error
 
     @pyqtSlot()
     def clear_dashboard_instance(self):
-        """Slot called when the training dashboard dialog is closed."""
+        """Slot called when training dashboard closes."""
         logger.debug("Training dashboard closed, clearing instance reference.")
         self.training_dashboard_instance = None
 
     def export_model(self):
+        """Exports trained model file (PRO ONLY)."""
+        # --- TIER CHECK ---
+        if self.current_tier != "PRO":
+            QMessageBox.information(
+                self, "Feature Unavailable", "Model Export requires the Pro tier."
+            )
+            logger.warning("[BASIC] Attempted to export model.")
+            return
+        # --- END TIER CHECK ---
+
         print("--- export_model called ---")
         is_dummy_state = StateManager.__name__ == "_DummyStateManager"
         if not self.state or is_dummy_state:
@@ -945,10 +1060,11 @@ class AnnotatorWindow(QMainWindow):
             )
             return
 
-        # Get the configured internal path for the trained model
         model_key = config.SETTING_KEYS.get("model_save_path")
         if not model_key:
-            QMessageBox.critical(self, "Config Error", "Model save path key missing.")
+            QMessageBox.critical(
+                self, "Config Error", "Model save path key missing in config."
+            )
             return
 
         internal_model_path = self.state.get_setting(
@@ -956,21 +1072,17 @@ class AnnotatorWindow(QMainWindow):
         )
         logger.debug(f"Checking for internal model at: {internal_model_path}")
 
-        # Check if the model file actually exists
         if not internal_model_path or not os.path.exists(internal_model_path):
             QMessageBox.warning(
                 self,
                 "Model Not Found",
                 f"Trained model not found:\n{internal_model_path}\n\nTrain the model at least once.",
             )
-            logger.warning(
-                f"Export failed: Model file not found at {internal_model_path}"
-            )
             return
 
-        # Suggest a filename and location for saving
+        # Suggest filename and location
         default_filename = os.path.basename(internal_model_path)
-        start_dir = os.path.expanduser("~")  # Start in user's home directory
+        start_dir = os.path.expanduser("~")  # Default to user's home directory
         save_path, _ = QFileDialog.getSaveFileName(
             self,
             "Save Trained Model As...",
@@ -978,9 +1090,8 @@ class AnnotatorWindow(QMainWindow):
             "PyTorch Model (*.pt)",
         )
 
-        # If user selected a path, copy the file
         if save_path:
-            # Ensure correct extension
+            # Ensure .pt extension
             if not save_path.lower().endswith(".pt"):
                 save_path += ".pt"
             try:
@@ -988,11 +1099,11 @@ class AnnotatorWindow(QMainWindow):
                     f"Exporting model to {os.path.basename(save_path)}..."
                 )
                 QCoreApplication.processEvents()  # Update UI
-                shutil.copy2(
-                    internal_model_path, save_path
-                )  # Use copy2 to preserve metadata
+                shutil.copy2(internal_model_path, save_path)  # Copy the file
                 self.update_status(f"Model exported: {os.path.basename(save_path)}.")
-                logger.info(f"Model exported from {internal_model_path} to {save_path}")
+                logger.info(
+                    f"[PRO] Model exported from {internal_model_path} to {save_path}"
+                )
             except Exception as e:
                 logger.exception(f"Failed to export model to {save_path}")
                 QMessageBox.critical(
@@ -1004,6 +1115,7 @@ class AnnotatorWindow(QMainWindow):
             logger.info("Model export cancelled by user.")
 
     def export_annotated_data(self):
+        """Exports approved annotations in YOLO format (Basic & Pro)."""
         print("--- export_annotated_data called ---")
         is_dummy_state = StateManager.__name__ == "_DummyStateManager"
         if not self.state or is_dummy_state:
@@ -1011,22 +1123,20 @@ class AnnotatorWindow(QMainWindow):
                 self, "Error", "Export unavailable (State Manager missing or dummy)."
             )
             return
-        # Check if the required method exists on the state manager
+        # Check if the state manager (real or dummy) has the required method
         if not hasattr(self.state, "export_data_for_yolo"):
             QMessageBox.critical(
                 self,
                 "Internal Error",
                 "State Manager missing 'export_data_for_yolo' method.",
             )
-            logger.error("Export failed: StateManager missing 'export_data_for_yolo'.")
             return
 
-        # Check if there's any approved data to export
+        # Check if there's anything approved to export
         approved_exists = False
         if hasattr(self.state, "annotations") and isinstance(
             self.state.annotations, dict
         ):
-            # Check if any value in the annotations dict has 'approved': True
             approved_exists = any(
                 d.get("approved", False) for d in self.state.annotations.values()
             )
@@ -1035,28 +1145,26 @@ class AnnotatorWindow(QMainWindow):
             QMessageBox.information(
                 self, "No Data", "No approved annotations available to export."
             )
-            logger.info("Data export cancelled: No approved annotations.")
             return
 
-        # Get last used directory as starting point for dialog
+        # Suggest starting directory (last image dir or home)
         last_img_dir_key = config.SETTING_KEYS.get("last_image_dir")
         start_dir = (
             self.state.get_setting(last_img_dir_key, os.path.expanduser("~"))
-            if last_img_dir_key
+            if self.state and last_img_dir_key and hasattr(self.state, "get_setting")
             else os.path.expanduser("~")
         )
         start_dir = (
             start_dir if os.path.isdir(start_dir) else os.path.expanduser("~")
         )  # Fallback if saved path invalid
 
-        # Ask user to select an *existing* directory
         export_dir = QFileDialog.getExistingDirectory(
             self, "Select Directory to Export YOLO Data Into", start_dir
         )
 
         if export_dir:
             logger.info(f"User selected directory for YOLO export: {export_dir}")
-            # Check if directory is empty and warn if not
+            # Check if directory is empty, warn if not
             try:
                 if os.listdir(export_dir):
                     reply = QMessageBox.warning(
@@ -1069,7 +1177,6 @@ class AnnotatorWindow(QMainWindow):
                     )
                     if reply == QMessageBox.StandardButton.Cancel:
                         self.update_status("Data export cancelled.")
-                        logger.info("Data export cancelled by user (non-empty dir).")
                         return
             except OSError as e:
                 QMessageBox.critical(
@@ -1079,16 +1186,14 @@ class AnnotatorWindow(QMainWindow):
                 )
                 return
 
-            # Call the state manager's export method
+            # Proceed with export
             try:
                 self.update_status(
                     f"Exporting YOLO data to {os.path.basename(export_dir)}..."
                 )
-                QCoreApplication.processEvents()  # Update UI
-
-                # State manager handles the actual export process
+                QCoreApplication.processEvents()
+                # State Manager handles the details of copying files and creating YAML
                 yaml_path = self.state.export_data_for_yolo(export_dir)
-
                 if yaml_path and os.path.exists(yaml_path):
                     self.update_status(
                         f"YOLO data exported: {os.path.basename(export_dir)}."
@@ -1097,16 +1202,16 @@ class AnnotatorWindow(QMainWindow):
                         f"YOLO data export successful. Target: {export_dir}, YAML: {yaml_path}"
                     )
                 else:
-                    # State manager method returned None or invalid path
                     logger.error(
-                        f"Data export process failed (StateManager returned: {yaml_path}). Check logs."
+                        f"Data export failed (StateManager returned: {yaml_path}). Check logs."
                     )
                     QMessageBox.warning(
                         self,
                         "Export Failed",
-                        "Failed to export data. Check application logs (app_debug.log).",
+                        "Failed to export data. Check logs (app_debug.log).",
                     )
                     self.update_status("Data export failed.")
+
             except Exception as e:
                 logger.exception(f"Unexpected error during data export to {export_dir}")
                 QMessageBox.critical(
@@ -1114,85 +1219,82 @@ class AnnotatorWindow(QMainWindow):
                 )
                 self.update_status("Data export failed.")
         else:
-            # User cancelled the directory selection dialog
             self.update_status("Data export cancelled.")
-            logger.info("Data export cancelled by user (no directory selected).")
+            logger.info("Data export cancelled by user.")
 
     @pyqtSlot()
     def force_mini_training(self):
-        logger.info("Force mini-training requested by user.")
+        """Manually triggers training run (PRO ONLY)."""
+        # --- TIER CHECK ---
+        if self.current_tier != "PRO":
+            QMessageBox.information(
+                self, "Feature Unavailable", "Manual Training requires the Pro tier."
+            )
+            logger.warning("[BASIC] Attempted to force mini-training.")
+            return
+        # --- END TIER CHECK ---
+
+        logger.info("[PRO] Force mini-training requested by user.")
         is_dummy_state = StateManager.__name__ == "_DummyStateManager"
         if not self.state or is_dummy_state:
             QMessageBox.warning(
                 self, "Error", "Training unavailable (State Manager missing or dummy)."
             )
             return
-        # Prevent starting if another task is active
         if self.state.is_task_active():
             QMessageBox.warning(
                 self, "Busy", "Another background task is currently running."
             )
             return
 
-        # Get current approved count robustly
+        # Check if there are approved images
         current_approved_count = 0
         if hasattr(self.state, "approved_count"):
             current_approved_count = self.state.approved_count
-        elif hasattr(self.state, "annotations"):
-            # Fallback: count manually if property doesn't exist
+        elif hasattr(self.state, "annotations"):  # Fallback count
             current_approved_count = sum(
                 1 for d in self.state.annotations.values() if d.get("approved")
             )
 
         if current_approved_count <= 0:
             QMessageBox.information(
-                self, "No Data", "Cannot force training without approved images."
+                self, "No Data", "Cannot force training without any approved images."
             )
-            logger.warning("Force training aborted: No approved images.")
             return
 
         try:
-            # Get training parameters from settings
+            # Get relevant settings for mini-train
             epochs_key = config.SETTING_KEYS.get("epochs_20")
             lr_key = config.SETTING_KEYS.get("lr_20")
             if not epochs_key or not lr_key:
                 QMessageBox.critical(
                     self,
                     "Config Error",
-                    "Training param keys ('epochs_20', 'lr_20') missing.",
+                    "Training parameter keys ('epochs_20', 'lr_20') missing.",
                 )
-                logger.error("Force training failed: Config keys missing.")
                 return
 
             epochs = self.state.get_setting(epochs_key, config.DEFAULT_EPOCHS_20)
             lr = self.state.get_setting(lr_key, config.DEFAULT_LR_20)
-            prefix = "force_mini"  # Specific prefix for forced runs
+            prefix = "force_mini"  # Use a specific prefix for manual runs
 
-            # Start the training directly now
             self.update_status(
                 f"Starting forced mini-training ({epochs} epochs, LR {lr:.6f})..."
             )
-            QCoreApplication.processEvents()  # Update UI
+            QCoreApplication.processEvents()
 
-            # Check for the start method
             if not hasattr(self.state, "start_training_task"):
                 logger.error("State manager missing 'start_training_task' method.")
                 QMessageBox.critical(
                     self, "Internal Error", "Cannot start training task."
                 )
-                self.update_status("Error starting forced training.")
                 return
 
-            # Call the state manager to start the task
+            # State manager handles data preparation and worker start
             success = self.state.start_training_task(epochs, lr, prefix)
-
             if not success:
-                # start_training_task might return False if task couldn't be started
+                # StateManager should have emitted an error signal or logged
                 self.update_status("Failed to start forced training task.")
-                logger.warning(
-                    "state.start_training_task returned False for forced run."
-                )
-                # State manager should handle emitting task_running(False) if it fails early
 
         except Exception as e:
             logger.exception("Error initiating forced mini-training.")
@@ -1203,66 +1305,52 @@ class AnnotatorWindow(QMainWindow):
 
     @pyqtSlot()
     def handle_settings_changed(self):
-        """Update relevant UI elements when settings change."""
+        """Updates relevant UI elements when settings change."""
         logger.info("GUI: Settings changed signal received.")
-        is_dummy_state = StateManager.__name__ == "_DummyStateManager"
-        if self.state and not is_dummy_state:
+        if self.state:
             try:
-                # Update confidence spinbox
-                spin = getattr(self, "confidence_spinbox", None)
-                if spin:
-                    conf_key = config.SETTING_KEYS.get("confidence_threshold")
-                    conf_default = config.DEFAULT_CONFIDENCE_THRESHOLD
-                    conf = (
-                        self.state.get_setting(conf_key, conf_default)
-                        if conf_key
-                        else conf_default
-                    )
-                    # Block signals temporarily to prevent loops if spinbox change triggers setting change
-                    spin.blockSignals(True)
-                    conf_percent = int(conf * 100)
-                    min_val, max_val = spin.minimum(), spin.maximum()
-                    clamped_val = max(min_val, min(conf_percent, max_val))
-                    spin.setValue(clamped_val)
-                    spin.blockSignals(False)
-                    logger.debug(
-                        f"Updated confidence spinbox from settings to {clamped_val}%"
-                    )
+                # Update confidence spinbox (only if Pro and widget exists)
+                if self.current_tier == "PRO":
+                    spin = getattr(self, "confidence_spinbox", None)
+                    if spin:
+                        conf_key = config.SETTING_KEYS.get("confidence_threshold")
+                        conf_default = config.DEFAULT_CONFIDENCE_THRESHOLD
+                        conf = (
+                            self.state.get_setting(conf_key, conf_default)
+                            if conf_key and hasattr(self.state, "get_setting")
+                            else conf_default
+                        )
+                        spin.blockSignals(True)  # Prevent triggering valueChanged slot
+                        conf_percent = int(conf * 100)
+                        min_val, max_val = spin.minimum(), spin.maximum()
+                        spin.setValue(max(min_val, min(conf_percent, max_val)))
+                        spin.blockSignals(False)
+                        logger.debug(
+                            f"[PRO] Updated confidence spinbox to {conf_percent}% from settings"
+                        )
 
-                # Update enabled state of ML controls based on pipeline availability
-                pipeline_ok = hasattr(self.state, "training_pipeline") and bool(
-                    self.state.training_pipeline
-                )
-                blocking_task_active = (
-                    self.state.is_task_active()
-                    if hasattr(self.state, "is_task_active")
-                    else False
-                )
-                enable_ml_controls = pipeline_ok and not blocking_task_active
+                # Re-evaluate enabled state based on new settings and task status
+                self.on_ml_task_running_changed(self._ml_task_active)
 
-                self.set_enabled_safe("auto_box_button", enable_ml_controls)
-                # Confidence spinbox only enabled if suggestions are possible AND check box is checked
-                self.set_enabled_safe(
-                    "confidence_spinbox",
-                    enable_ml_controls and self.auto_box_button.isChecked(),
-                )
-
-                # Update status bar message
                 status_msg = "Settings updated."
-                if not pipeline_ok:
+                # Add warning if pipeline seems missing (relevant for Pro)
+                is_dummy_state = StateManager.__name__ == "_DummyStateManager"
+                is_dummy_pipeline = TrainingPipeline.__name__.startswith("_Dummy")
+                if self.current_tier == "PRO" and (
+                    is_dummy_state
+                    or is_dummy_pipeline
+                    or not hasattr(self.state, "training_pipeline")
+                    or not self.state.training_pipeline
+                ):
                     status_msg += " Warning: ML Pipeline may be unavailable."
                 self.update_status(status_msg)
-
-                # Potentially update other UI elements if needed based on settings
 
             except Exception as e:
                 logger.error(
                     f"Error applying settings changes to UI: {e}", exc_info=True
                 )
         else:
-            logger.warning(
-                "Cannot apply settings changes to UI: State Manager unavailable or dummy."
-            )
+            logger.warning("Cannot apply settings changes: State Manager unavailable.")
 
     @pyqtSlot(str)
     def update_status(self, message: str):
@@ -1270,189 +1358,205 @@ class AnnotatorWindow(QMainWindow):
         lbl = getattr(self, "status_label", None)
         if lbl:
             try:
-                # Ensure message is a string
                 lbl.setText(str(message) if message is not None else "")
-                # Process events briefly to ensure UI updates, especially for longer tasks
-                QCoreApplication.processEvents()
-            except Exception as e:
-                # Avoid crashing if status update fails
-                logger.error(f"Failed to update status label: {e}")
+                QCoreApplication.processEvents()  # Ensure update is visible
+            except Exception:
+                logger.error("Failed to update status label.")
 
-        # Log status updates differently based on content
+        # Simple logging distinction for progress vs final messages
         lower_msg = str(message).lower() if message else ""
-        is_progress_update = any(
-            k in lower_msg
-            for k in [
-                "predict",
-                "update",
-                "train",
-                "loading",
-                "saving",
-                "requesting",
-                "checking",
-                "navigat",
-                "starting",
-                "exporting",
-            ]
-        )
-        is_final_state = any(
-            k in lower_msg
-            for k in [
-                "complete",
-                "error",
-                "fail",
-                "approved",
-                "loaded",
-                "saved",
-                "ready",
-                "found",
-                "unavailable",
-                "cancelled",
-                "exported",
-                "finished",
-                "unchanged",
-            ]
-        )
-
-        # Log progress updates at DEBUG, final states or general info at INFO
-        if is_progress_update and not is_final_state:
+        progress_keys = [
+            "predict",
+            "update",
+            "train",
+            "loading",
+            "saving",
+            "requesting",
+            "checking",
+            "navigat",
+            "starting",
+            "exporting",
+        ]
+        final_keys = [
+            "complete",
+            "error",
+            "fail",
+            "approved",
+            "loaded",
+            "saved",
+            "ready",
+            "found",
+            "unavailable",
+            "cancelled",
+            "exported",
+            "finished",
+            "unchanged",
+        ]
+        is_progress = any(k in lower_msg for k in progress_keys)
+        is_final = any(k in lower_msg for k in final_keys)
+        if is_progress and not is_final:
             logger.debug(f"Status Update: {message}")
         else:
             logger.info(f"Status Update: {message}")
 
-    def load_directory(self):
-        """Opens dialog to select image directory and loads images via StateManager."""
+    # Inside the AnnotatorWindow class definition:
+
+    def save_session(self):
+        """Saves the current session via the StateManager."""
         if (
             self.state
             and hasattr(self.state, "is_task_active")
             and self.state.is_task_active()
         ):
-            QMessageBox.warning(self, "Busy", "Background task running. Please wait.")
+            QMessageBox.warning(
+                self, "Busy", "Cannot save session while a background task is running."
+            )
+            return
+        if not self.state:
+            QMessageBox.warning(
+                self, "Error", "Save unavailable (State Manager missing)."
+            )
+            return
+        if not hasattr(self.state, "save_session"):
+            QMessageBox.critical(
+                self, "Internal Error", "State Manager missing 'save_session' method."
+            )
             return
 
-        is_dummy_state = StateManager.__name__ == "_DummyStateManager"
-        if not self.state:  # Check if state exists at all
-            QMessageBox.warning(self, "Error", "State Manager not available.")
-            return
-        elif is_dummy_state:  # State exists but is dummy
-            logger.info("Using dummy state manager for load directory.")
-            # Allow dummy load to proceed for UI testing if desired
+        try:
+            # Get the intended save path from settings (could be default or user-set)
+            session_path_key = config.SETTING_KEYS.get("session_path")
+            session_file = (
+                self.state.get_setting(session_path_key, config.DEFAULT_SESSION_PATH)
+                if session_path_key
+                else config.DEFAULT_SESSION_PATH
+            )
 
-        # Get last used directory from settings
+            self.update_status(f"Saving session to {os.path.basename(session_file)}...")
+            QCoreApplication.processEvents()  # Update UI
+
+            self.state.save_session()  # Call the state manager's save method
+
+            # Check if save was successful (StateManager should log errors)
+            # We can assume success if no exception occurred, but could add checks later if needed
+            self.update_status(f"Session saved: {os.path.basename(session_file)}.")
+            logger.info(f"Session saved successfully via UI action to {session_file}.")
+
+        except Exception as e:
+            logger.exception(f"Error during save_session UI action")
+            QMessageBox.critical(self, "Save Error", f"Failed to save session:\n{e}")
+            self.update_status("Session save failed.")
+
+    # ... (rest of your AnnotatorWindow methods) ...
+
+    def load_directory(self):
+        """Opens dialog to select image directory and loads images."""
+        if (
+            self.state
+            and hasattr(self.state, "is_task_active")
+            and self.state.is_task_active()
+        ):
+            QMessageBox.warning(
+                self,
+                "Busy",
+                "Cannot load directory while a background task is running.",
+            )
+            return
+        if not self.state:
+            QMessageBox.warning(self, "Error", "State Manager unavailable.")
+            return
+
         last_dir_key = config.SETTING_KEYS.get("last_image_dir")
         last_dir = (
             self.state.get_setting(last_dir_key, os.path.expanduser("~"))
-            if last_dir_key
+            if self.state and last_dir_key and hasattr(self.state, "get_setting")
             else os.path.expanduser("~")
         )
         last_dir = (
             last_dir if os.path.isdir(last_dir) else os.path.expanduser("~")
         )  # Fallback
-
-        # Open directory dialog
         dir_path = QFileDialog.getExistingDirectory(
             self, "Select Image Directory", last_dir
         )
 
-        if dir_path and self.state:  # Check state again just in case
-            # Save selected directory path to settings
+        if dir_path and self.state:
+            # Save the selected directory path
             if last_dir_key and hasattr(self.state, "set_setting"):
                 try:
                     self.state.set_setting(last_dir_key, dir_path)
-                except Exception as e_set:
-                    logger.error(
-                        f"Failed to save last image directory setting: {e_set}"
-                    )
+                except Exception:
+                    pass  # Non-critical if saving setting fails
 
             self.update_status(f"Loading images from: {os.path.basename(dir_path)}...")
-            QCoreApplication.processEvents()  # Show status update
-
-            # Ask state manager to load images
+            QCoreApplication.processEvents()
             try:
                 if hasattr(self.state, "load_images_from_directory"):
                     self.state.load_images_from_directory(dir_path)
-                    logger.info("StateManager finished loading images from directory.")
                 else:
-                    logger.error("State manager missing 'load_images_from_directory'.")
-                    raise AttributeError("Missing load method in state manager.")
+                    raise AttributeError(
+                        "State Manager missing 'load_images_from_directory' method."
+                    )
             except Exception as e:
-                logger.exception(
-                    "Failed during StateManager.load_images_from_directory"
-                )
-                QMessageBox.critical(
-                    self, "Load Error", f"Failed to process directory contents:\n{e}"
-                )
-                self.update_status("Directory load error.")
-                self.clear_ui_on_load_failure()  # Reset UI
+                logger.exception("Failed StateManager.load_images_from_directory")
+                QMessageBox.critical(self, "Load Error", f"Failed to load images:\n{e}")
+                self.clear_ui_on_load_failure()  # Clear UI state
                 return
 
-            # Check if images were loaded and update UI
-            current_image_list = getattr(self.state, "image_list", [])
-            if current_image_list:
-                current_index = getattr(self.state, "current_index", -1)
-                # Ensure index is valid after load
-                if not (
-                    isinstance(current_index, int)
-                    and 0 <= current_index < len(current_image_list)
-                ):
-                    logger.warning("Index invalid after load, resetting to 0.")
+            # Check if images were actually loaded
+            img_list = getattr(self.state, "image_list", [])
+            if img_list:
+                # Ensure current index is valid (should be handled by state manager, but double check)
+                idx = getattr(self.state, "current_index", -1)
+                if not (isinstance(idx, int) and 0 <= idx < len(img_list)):
                     if hasattr(self.state, "go_to_image"):
-                        self.state.go_to_image(0)
-                self.load_image()  # Load the first/current image into the view
-                self._update_annotated_count_label()  # Update counts
-                self.update_status(
-                    f"Loaded {len(current_image_list)} images from {os.path.basename(dir_path)}."
-                )
+                        self.state.go_to_image(0)  # Go to first if index invalid
+
+                self.load_image()  # Load the first/current image
+                self._update_annotated_count_label()  # Update count based on potentially reset state
+                self.update_status(f"Loaded {len(img_list)} images.")
             else:
-                # No images found or loaded
-                self.clear_ui_on_load_failure()  # Clear graphics view etc.
-                self.update_status("No supported image files found.")
+                self.clear_ui_on_load_failure()  # Clear UI if no images found
+                self.update_status("No supported images found in directory.")
                 QMessageBox.information(
                     self,
                     "No Images",
-                    "No supported images found in the selected directory.",
+                    "No supported image files found in the selected directory.",
                 )
         elif not dir_path:
-            # User cancelled the dialog
-            self.update_status("Load directory cancelled.")
-            logger.info("User cancelled loading directory.")
+            self.update_status("Load cancelled.")
 
     def clear_ui_on_load_failure(self):
-        """Clears image display and resets counts when loading fails or finds no images."""
-        logger.debug("Clearing UI due to load failure or empty list.")
+        """Clears UI elements when loading fails or finds no images."""
+        logger.debug("Clearing UI on load failure/empty.")
         scene = getattr(self, "graphics_scene", None)
         if isinstance(scene, AnnotationScene):
-            scene.set_image(None)  # Clear image in scene
-            scene.clear_annotations()  # Remove any previous boxes
-        self.clear_suggestion_boxes()  # Remove suggestion boxes
-        self.setWindowTitle("Annotator")  # Reset title
-        self._update_image_count_label()  # Reset image count display
-        self._update_annotated_count_label()  # Reset annotated count display
-        self.last_box_data = None  # Clear last pasted box data
+            scene.set_image(None)
+            scene.clear_annotations()
+        self.clear_suggestion_boxes()  # Clear any old suggestions
+        self.setWindowTitle(f"Annotator [{self.current_tier}]")  # Reset title
+        self._update_image_count_label()
+        self._update_annotated_count_label()
+        self.last_box_data = None  # Clear last pasted box
 
     def load_session_explicitly(self):
-        """Opens dialog to select session file and loads via StateManager."""
+        """Opens dialog to select session file and loads."""
         if (
             self.state
             and hasattr(self.state, "is_task_active")
             and self.state.is_task_active()
         ):
-            QMessageBox.warning(self, "Busy", "Background task running.")
+            QMessageBox.warning(
+                self, "Busy", "Cannot load session while a background task is running."
+            )
             return
-
-        is_dummy_state = StateManager.__name__ == "_DummyStateManager"
         if not self.state:
             QMessageBox.warning(self, "Error", "State Manager unavailable.")
             return
-        elif is_dummy_state:
-            logger.info("Using dummy state manager for load session.")
-            # Allow dummy load for UI testing
 
-        # Determine starting path for dialog
         session_key = config.SETTING_KEYS.get("session_path")
         start_path = (
             self.state.get_setting(session_key, config.DEFAULT_SESSION_PATH)
-            if session_key
+            if self.state and session_key and hasattr(self.state, "get_setting")
             else config.DEFAULT_SESSION_PATH
         )
         start_dir = (
@@ -1463,124 +1567,60 @@ class AnnotatorWindow(QMainWindow):
         start_dir = (
             start_dir if os.path.isdir(start_dir) else os.path.expanduser("~")
         )  # Fallback
-
-        # Define file filter
         session_ext = os.path.splitext(config.DEFAULT_SESSION_FILENAME)[1]
         file_filter = f"Session Files (*{session_ext});;All Files (*)"
-        # Open file dialog
         file_path, _ = QFileDialog.getOpenFileName(
             self, "Load Session", start_dir, file_filter
         )
 
         if file_path:
             self.update_status(f"Loading session: {os.path.basename(file_path)}...")
-            QCoreApplication.processEvents()  # Show status update
+            QCoreApplication.processEvents()
             load_ok = False
             try:
                 if hasattr(self.state, "load_session"):
-                    # StateManager handles the actual loading
-                    load_ok = self.state.load_session(file_path=file_path)
+                    load_ok = self.state.load_session(
+                        file_path=file_path
+                    )  # Pass specific path
                 else:
-                    logger.error("State manager missing 'load_session' method.")
-                    raise AttributeError("Missing load method")
+                    raise AttributeError("State Manager missing 'load_session' method.")
             except Exception as e:
-                logger.exception("Critical error during StateManager.load_session")
-                QMessageBox.critical(
-                    self, "Load Error", f"Critical error loading session:\n{e}"
-                )
-                self.update_status("Session load failed critically.")
-                self.clear_ui_on_load_failure()  # Reset UI
+                logger.exception("Error during StateManager.load_session")
+                QMessageBox.critical(self, "Load Error", f"Error loading session:\n{e}")
+                self.clear_ui_on_load_failure()  # Clear UI state
                 return
 
-            # If StateManager reported success, update UI
             if load_ok:
-                logger.info("StateManager reported session loaded successfully.")
                 self.update_status(f"Session loaded: {os.path.basename(file_path)}.")
-                self.load_image()  # Load the current image from the session
-                self._update_annotated_count_label()  # Update counts
-                self.handle_settings_changed()  # Apply any settings loaded with session
-
-                # Re-evaluate ML control states after session load
-                pipeline_ok = hasattr(self.state, "training_pipeline") and bool(
-                    self.state.training_pipeline
-                )
-                blocking_task_active = (
-                    self.state.is_task_active()
-                    if hasattr(self.state, "is_task_active")
-                    else False
-                )
-                enable_ml_controls = pipeline_ok and not blocking_task_active
-                self.set_enabled_safe("auto_box_button", enable_ml_controls)
-                self.set_enabled_safe(
-                    "confidence_spinbox",
-                    enable_ml_controls and self.auto_box_button.isChecked(),
-                )
-
-                status_msg = "Session loaded successfully."
-                if not pipeline_ok:
-                    status_msg += " Warning: ML Pipeline unavailable."
+                self.load_image()  # Load the image at the restored index
+                self._update_annotated_count_label()  # Update count based on loaded data
+                self.handle_settings_changed()  # Apply any settings potentially loaded from session/defaults
+                # Re-apply enable state (task should not be running after load)
+                self.on_ml_task_running_changed(False)
+                # Add pipeline warning if needed
+                status_msg = "Session loaded."
+                is_dummy_state = StateManager.__name__ == "_DummyStateManager"
+                is_dummy_pipeline = TrainingPipeline.__name__.startswith("_Dummy")
+                if self.current_tier == "PRO" and (
+                    is_dummy_state
+                    or is_dummy_pipeline
+                    or not hasattr(self.state, "training_pipeline")
+                    or not self.state.training_pipeline
+                ):
+                    status_msg += " Warning: ML Pipeline may be unavailable."
                 self.update_status(status_msg)
             else:
-                # StateManager reported failure
+                # State manager reported failure (e.g., file corrupt)
                 logger.error(
-                    f"StateManager reported failure loading session: {file_path}"
+                    f"StateManager reported failure loading session file: {file_path}"
                 )
                 QMessageBox.critical(
-                    self,
-                    "Load Error",
-                    f"Failed to load session file:\n{file_path}\nMay be corrupt or invalid.",
+                    self, "Load Error", f"Failed to load session file:\n{file_path}"
                 )
                 self.update_status("Session load failed.")
-                self.clear_ui_on_load_failure()  # Reset UI
+                self.clear_ui_on_load_failure()  # Clear UI state
         else:
-            # User clicked Cancel
-            self.update_status("Load session cancelled.")
-            logger.info("User cancelled loading session.")
-
-    def save_session(self):
-        """Saves the current session via StateManager."""
-        if (
-            self.state
-            and hasattr(self.state, "is_task_active")
-            and self.state.is_task_active()
-        ):
-            QMessageBox.warning(self, "Busy", "Background task running.")
-            return
-
-        is_dummy_state = StateManager.__name__ == "_DummyStateManager"
-        if not self.state:
-            QMessageBox.warning(self, "Error", "State Manager unavailable.")
-            return
-        elif is_dummy_state:
-            logger.info("Using dummy state manager for save session.")
-            self.update_status("Session save skipped (Dummy).")
-            return  # Don't attempt save with dummy
-
-        self.update_status("Saving session...")
-        QCoreApplication.processEvents()  # Show status
-        try:
-            if hasattr(self.state, "save_session"):
-                self.state.save_session()  # StateManager handles file path etc.
-                # Check status *after* save attempt, in case save_session updates it on error
-                current_status = getattr(self.status_label, "text", lambda: "")()
-                if (
-                    "error" not in current_status.lower()
-                    and "fail" not in current_status.lower()
-                ):
-                    self.update_status("Session saved.")
-                    logger.info("Session saved successfully via StateManager.")
-                else:
-                    # save_session might have already set an error status
-                    logger.warning(
-                        "Save completed but status indicates error during save."
-                    )
-            else:
-                logger.error("State manager missing 'save_session' method.")
-                raise AttributeError("Missing save method")
-        except Exception as e:
-            logger.exception("Failed to save session via StateManager")
-            QMessageBox.critical(self, "Save Error", f"Failed to save session:\n{e}")
-            self.update_status("Session save error.")
+            self.update_status("Load cancelled.")
 
     def next_image(self):
         """Navigate to the next image."""
@@ -1589,25 +1629,18 @@ class AnnotatorWindow(QMainWindow):
             and hasattr(self.state, "is_task_active")
             and self.state.is_task_active()
         ):
-            self.update_status("Busy with background task.")
+            self.update_status("Busy. Cannot navigate now.")
             return
         if not self.state or not hasattr(self.state, "next_image"):
             self.update_status("Navigation unavailable.")
             return
         try:
-            # State manager handles index change
             if self.state.next_image():
-                self.load_image()  # Load the new image
-            else:
-                # Only show 'end' message if not busy (prevent overwriting task status)
-                if not (
-                    self.state
-                    and hasattr(self.state, "is_task_active")
-                    and self.state.is_task_active()
-                ):
-                    self.update_status("Already at the end.")
+                self.load_image()
+            elif not self._ml_task_active:
+                self.update_status("Already at the end.")  # Only show if not busy
         except Exception as e:
-            logger.exception("Error navigating next image.")
+            logger.exception("Error navigating next")
             self.update_status("Navigation error.")
 
     def prev_image(self):
@@ -1617,113 +1650,27 @@ class AnnotatorWindow(QMainWindow):
             and hasattr(self.state, "is_task_active")
             and self.state.is_task_active()
         ):
-            self.update_status("Busy with background task.")
+            self.update_status("Busy. Cannot navigate now.")
             return
         if not self.state or not hasattr(self.state, "prev_image"):
             self.update_status("Navigation unavailable.")
             return
         try:
-            # State manager handles index change
             if self.state.prev_image():
-                self.load_image()  # Load the new image
-            else:
-                # Only show 'start' message if not busy
-                if not (
-                    self.state
-                    and hasattr(self.state, "is_task_active")
-                    and self.state.is_task_active()
-                ):
-                    self.update_status("Already at the start.")
+                self.load_image()
+            elif not self._ml_task_active:
+                self.update_status("Already at the start.")  # Only show if not busy
         except Exception as e:
-            logger.exception("Error navigating previous image.")
+            logger.exception("Error navigating previous")
             self.update_status("Navigation error.")
 
-    def manage_classes(self):
-        """Opens dialog to manage annotation classes."""
-        if (
-            self.state
-            and hasattr(self.state, "is_task_active")
-            and self.state.is_task_active()
-        ):
-            QMessageBox.warning(self, "Busy", "Background task running.")
-            return
-
-        is_dummy_state = StateManager.__name__ == "_DummyStateManager"
-        if not self.state or is_dummy_state:
-            QMessageBox.warning(self, "Error", "State Manager unavailable or dummy.")
-            return
-
-        current_classes = getattr(self.state, "class_list", [])
-        current_text = "\n".join(current_classes)  # Present one class per line
-
-        # Get user input using multi-line text dialog
-        new_text, ok = QInputDialog.getMultiLineText(
-            self, "Manage Classes", "Edit Classes (one per line):", current_text
-        )
-
-        if ok:  # User clicked OK
-            # Process input: split lines, strip whitespace, remove empty lines, ensure unique, sort
-            new_classes_list = sorted(
-                list(
-                    set(line.strip() for line in new_text.splitlines() if line.strip())
-                )
-            )
-
-            # Check if changes were actually made
-            if new_classes_list != current_classes:
-                logger.info(
-                    f"User proposed class change: {current_classes} -> {new_classes_list}"
-                )
-                # Warn about consequences
-                reply = QMessageBox.warning(
-                    self,
-                    "Confirm Class Change",
-                    "Changing classes removes annotations using removed classes.\nThis cannot be undone.\n\nUpdate classes?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-                    QMessageBox.StandardButton.Cancel,
-                )
-                if reply == QMessageBox.StandardButton.Yes:
-                    logger.info("User confirmed class change.")
-                    if hasattr(self.state, "update_classes"):
-                        try:
-                            # Ask StateManager to update classes and handle annotation cleanup
-                            self.state.update_classes(new_classes_list)
-                            self._update_annotated_count_label()  # Update count display
-                            self.update_status(
-                                "Classes updated. Removed annotations deleted."
-                            )
-                            # Reload current image to reflect potential annotation changes
-                            self.load_image()
-                        except Exception as e:
-                            logger.exception("Failed during state.update_classes call")
-                            QMessageBox.critical(
-                                self, "Error", f"Failed to update classes:\n{e}"
-                            )
-                    else:
-                        logger.error("StateManager missing 'update_classes' method.")
-                        QMessageBox.critical(
-                            self, "Internal Error", "Cannot update classes."
-                        )
-                else:
-                    self.update_status("Class change cancelled.")
-                    logger.info("User cancelled class change.")
-            else:
-                self.update_status("Classes unchanged.")
-                logger.info("User edited classes, no effective changes.")
-        else:
-            # User clicked Cancel
-            self.update_status("Class management cancelled.")
-            logger.info("User cancelled managing classes.")
-
     def load_image(self, image_path=None):
-        """Loads an image into the scene, or clears it. Optionally loads specific path."""
-        # Determine the path to load
-        path_to_load = image_path  # Use explicit path if given
+        """Loads an image, displays annotations, triggers suggestions if Pro."""
+        path_to_load = image_path
         source_info = "explicit path"
         current_img = None
-
+        # If no path given, get from state manager
         if not path_to_load:
-            # If no explicit path, get current image from state manager
             if self.state and hasattr(self.state, "get_current_image"):
                 current_img = self.state.get_current_image()
                 if current_img:
@@ -1731,35 +1678,28 @@ class AnnotatorWindow(QMainWindow):
                     idx = getattr(self.state, "current_index", "?")
                     source_info = f"state index {idx}"
                 else:
-                    # State manager exists but has no current image (e.g., list empty)
                     source_info = "state has no current image"
             else:
-                # State manager doesn't exist or lacks method
-                source_info = "state unavailable or missing method"
+                source_info = "state unavailable"
 
         base_name = os.path.basename(path_to_load) if path_to_load else "None"
         logger.info(f"Load Image Request: '{base_name}' (Source: {source_info}).")
 
-        # Get the graphics scene
         scene = getattr(self, "graphics_scene", None)
+        # Check if scene is the real one, not dummy
         if not isinstance(scene, AnnotationScene):
-            logger.critical(
-                f"Cannot load image: Graphics scene is invalid or dummy ({type(scene)})!"
-            )
-            self.update_status("Error: Graphics scene unavailable.")
-            self.clear_ui_on_load_failure()  # Attempt to clear UI
+            logger.critical(f"Cannot load image: Scene invalid/dummy ({type(scene)})!")
+            self.clear_ui_on_load_failure()  # Clear UI if scene is bad
             return
 
-        # Clear previous annotations and suggestions from scene
+        # Clear existing annotations and suggestions before loading new image
         try:
-            scene.clear_annotations()  # Also clears suggestions now
-            self.clear_suggestion_boxes()  # Explicitly clear tracked suggestions
-            logger.debug("Cleared existing items from scene.")
-        except Exception as e:
-            logger.exception("Error clearing scene before loading image.")
-            # Attempt to continue if clearing failed
+            scene.clear_annotations()
+            self.clear_suggestion_boxes()
+            logger.debug("Cleared scene items before loading new image.")
+        except Exception:
+            logger.exception("Error clearing scene before load.")
 
-        # Attempt to load the image into the scene
         load_ok = False
         img_width, img_height = 0, 0
         if path_to_load and os.path.exists(path_to_load):
@@ -1767,50 +1707,45 @@ class AnnotatorWindow(QMainWindow):
                 if hasattr(scene, "set_image"):
                     load_ok = scene.set_image(path_to_load)
                     if load_ok and hasattr(scene, "get_image_size"):
-                        # Get dimensions from scene after successful load
                         img_width, img_height = scene.get_image_size()
                         if img_width <= 0 or img_height <= 0:
                             logger.error(
-                                f"Scene returned invalid size ({img_width}x{img_height}) for {base_name}"
+                                f"Scene reported invalid image size {img_width}x{img_height} after load."
                             )
-                            load_ok = False  # Treat as load failure
+                            load_ok = False
                     elif not load_ok:
-                        # scene.set_image itself reported failure
-                        logger.error(f"scene.set_image returned False for {base_name}")
+                        logger.error(
+                            f"scene.set_image reported failure for {base_name}"
+                        )
                 else:
-                    logger.error("Scene object missing 'set_image' method.")
-                    load_ok = False  # Cannot load
+                    logger.error("Scene missing 'set_image' method.")
+                    load_ok = False
             except Exception as e:
                 logger.exception(f"Error during scene.set_image for {base_name}.")
-                self.update_status(f"Error loading image file: {base_name}")
+                self.update_status(f"Error loading image: {base_name}")
                 load_ok = False
-        elif path_to_load:
-            # Path provided but file doesn't exist
-            logger.error(f"Image path specified but file not found: {path_to_load}")
+        elif path_to_load:  # Path provided but doesn't exist
+            logger.error(f"Image file not found: {path_to_load}")
             self.update_status("Error: Image file not found.")
             load_ok = False
-        else:
-            # No path to load (list empty, index invalid, etc.)
+        else:  # No path to load (e.g., empty list)
             logger.info("No image path to load (list empty or index invalid).")
             try:
-                # Explicitly clear the scene if no image is loaded
-                if hasattr(scene, "set_image"):
-                    scene.set_image(None)
-            except Exception as clear_err:
-                logger.error(f"Error clearing scene when no image path: {clear_err}")
+                scene.set_image(None)  # Clear the scene
+            except Exception:
+                pass
             load_ok = False
 
-        # Update image count label regardless of success
-        self._update_image_count_label()
+        self._update_image_count_label()  # Update count regardless of success
         view = getattr(self, "graphics_view", None)
 
         if load_ok:
-            # --- Actions on successful load ---
-            logger.info(f"Image loaded: {base_name} ({img_width}x{img_height})")
-            self.setWindowTitle(f"Annotator - {base_name}")
+            logger.info(
+                f"Image loaded successfully: {base_name} ({img_width}x{img_height})"
+            )
+            self.setWindowTitle(f"Annotator - {base_name} [{self.current_tier}]")
             self.update_status(f"Loaded: {base_name}")
-
-            # Fit view to image
+            # Fit view to the new image
             if (
                 view
                 and isinstance(view, AnnotatorGraphicsView)
@@ -1818,108 +1753,89 @@ class AnnotatorWindow(QMainWindow):
             ):
                 try:
                     scene_rect = scene.sceneRect()
-                    if scene_rect.isValid() and not scene_rect.isEmpty():
-                        view.fitInView(scene_rect, Qt.AspectRatioMode.KeepAspectRatio)
-                        # Reset zoom level after fitInView
-                        if hasattr(view, "_zoom"):
-                            view._zoom = 0
-                    logger.debug("View fit to image.")
-                except Exception as e:
-                    logger.error(f"Error fitting view: {e}")
+                    view.fitInView(scene_rect, Qt.AspectRatioMode.KeepAspectRatio)
+                    if hasattr(view, "_zoom"):
+                        view._zoom = 0  # Reset zoom level
+                except Exception:
+                    logger.error("Error fitting view to image.")
 
-            # Load existing annotations from state manager
+            # Load annotations for this image from state manager
             annotation_data = None
-            if (
-                self.state
-                and hasattr(self.state, "annotations")
-                and isinstance(self.state.annotations, dict)
-            ):
+            if self.state and hasattr(self.state, "annotations"):
                 annotation_data = self.state.annotations.get(path_to_load)
 
             if annotation_data:
-                # Check flags
-                is_negative = annotation_data.get("negative", False)
-                is_approved = annotation_data.get("approved", False)
+                is_neg = annotation_data.get("negative", False)
+                is_appr = annotation_data.get("approved", False)
                 box_list = annotation_data.get("annotations_list", [])
                 logger.info(
-                    f"Annotation data: Approved={is_approved}, Negative={is_negative}, Boxes={len(box_list)}"
+                    f"Annotation data found: Approved={is_appr}, Negative={is_neg}, Boxes={len(box_list)}"
                 )
-
-                # Get the class for drawing boxes (check it's not the dummy)
+                # Check if using Dummy ResizableRectItem
                 rect_item_class = ResizableRectItem
                 if rect_item_class.__name__ != "DummyResizableRectItem":
-                    items_added_count = 0
-                    # Add annotation items to the scene
+                    items_added = 0
                     for ann in box_list:
                         if hasattr(scene, "add_annotation_item_from_data"):
                             try:
-                                # Scene method handles conversion from pixel to scene coords
-                                item_added = scene.add_annotation_item_from_data(
+                                # Pass image dimensions for coordinate mapping
+                                if scene.add_annotation_item_from_data(
                                     ann, img_width, img_height
-                                )
-                                if item_added:
-                                    items_added_count += 1
+                                ):
+                                    items_added += 1
                                 else:
                                     logger.warning(
-                                        f"add_annotation_item_from_data failed for: {ann}"
+                                        f"Failed to add annotation item from data: {ann}"
                                     )
                             except Exception as e_add:
                                 logger.error(
-                                    f"Failed add annotation item {ann}: {e_add}",
+                                    f"Error adding annotation item {ann}: {e_add}",
                                     exc_info=True,
                                 )
                         else:
                             logger.error(
-                                "Scene missing 'add_annotation_item_from_data'."
+                                "Scene missing 'add_annotation_item_from_data' method."
                             )
-                            break  # Stop trying if method missing
-                    if items_added_count > 0:
-                        logger.info(
-                            f"Displayed {items_added_count} saved annotation boxes."
-                        )
+                            break  # Stop if method missing
+                    if items_added > 0:
+                        logger.info(f"Displayed {items_added} saved annotations.")
                 else:
                     logger.critical(
                         "Cannot display saved annotations: Using DummyResizableRectItem."
                     )
 
-                # Add visual indicator for negative images if applicable
-                if is_negative:
+                # Add visual indicator for negative images
+                if is_neg:
                     try:
-                        from PyQt6.QtWidgets import QGraphicsTextItem
-
-                        neg_indicator = QGraphicsTextItem("[Negative Image]")
-                        neg_indicator.setDefaultTextColor(
-                            QColor(200, 200, 200, 180)
-                        )  # Semi-transparent grey
-                        neg_indicator.setPos(10, 10)  # Position near top-left
-                        neg_indicator.setZValue(
-                            10
-                        )  # Ensure it's above image but below boxes
-                        scene.addItem(neg_indicator)
-                        logger.debug("Added [Negative Image] indicator.")
-                    except Exception as e:
-                        logger.error(f"Failed to add [Negative Image] indicator: {e}")
+                        neg_ind = QGraphicsTextItem("[Negative Image]")
+                        neg_ind.setDefaultTextColor(QColor(200, 200, 200, 180))
+                        neg_ind.setPos(10, 10)  # Position near top-left
+                        neg_ind.setZValue(10)  # Ensure it's above image but below boxes
+                        scene.addItem(neg_ind)
+                    except Exception:
+                        logger.error("Failed to add [Negative Image] indicator.")
             else:
-                # No annotation data found in state for this image
-                logger.info(f"No annotation data in state for: {base_name}")
+                logger.info(f"No annotation data found in state for: {base_name}")
 
-            # Check if auto-suggestions should be displayed
-            auto_box_checkbox = getattr(self, "auto_box_button", None)
-            if auto_box_checkbox and auto_box_checkbox.isChecked():
-                logger.debug("Auto-suggestions checked, triggering check.")
-                self.toggle_auto_boxes()  # Will request predictions if needed
+            # --- TIERING: Trigger suggestions if Pro and checkbox is checked ---
+            auto_box_btn = getattr(self, "auto_box_button", None)
+            if self.current_tier == "PRO" and auto_box_btn and auto_box_btn.isChecked():
+                logger.debug(
+                    "[PRO] Auto-suggestions checkbox is checked, triggering toggle_auto_boxes."
+                )
+                # Use QTimer to ensure UI is fully updated before starting task
+                QTimer.singleShot(50, self.toggle_auto_boxes)
             else:
-                self.clear_suggestion_boxes()  # Ensure suggestions are cleared if box unchecked
+                self.clear_suggestion_boxes()  # Ensure suggestions are cleared if not Pro or box unchecked
 
-            # Set focus to the graphics view for keyboard events (delete, etc.)
+            # Set focus to the view for keyboard events
             if view and isinstance(view, AnnotatorGraphicsView):
-                logger.debug("Setting focus to graphics view.")
                 view.setFocus()
-        else:
-            # --- Actions on failed load ---
-            self.setWindowTitle("Annotator")
-            # Avoid overwriting specific error messages if already set
+
+        else:  # Load failed
+            self.setWindowTitle(f"Annotator [{self.current_tier}]")  # Reset title
             current_status = getattr(self.status_label, "text", lambda: "")()
+            # Update status only if it wasn't already an error message
             if (
                 "error" not in current_status.lower()
                 and "fail" not in current_status.lower()
@@ -1928,144 +1844,134 @@ class AnnotatorWindow(QMainWindow):
                     self.update_status(f"Failed to load image: {base_name}")
                 else:
                     self.update_status("No image selected or list empty.")
-            # Ensure scene is cleared
             if isinstance(scene, AnnotationScene):
-                scene.set_image(None)
-            self.clear_suggestion_boxes()
+                scene.set_image(None)  # Clear scene on failure
+            self.clear_suggestion_boxes()  # Clear suggestions on failure
 
     def approve_image(self):
-        """Marks the current image as approved and navigates to the next unannotated one."""
+        """Marks image approved, saves, navigates (Basic & Pro)."""
         is_dummy_state = StateManager.__name__ == "_DummyStateManager"
         if not self.state or is_dummy_state:
-            QMessageBox.warning(self, "Error", "State Manager unavailable or dummy.")
+            QMessageBox.warning(
+                self, "Error", "Approval unavailable (State Manager missing or dummy)."
+            )
             return
 
-        # Get current image path and scene
         current_path = (
             self.state.get_current_image()
             if hasattr(self.state, "get_current_image")
             else None
         )
         scene = getattr(self, "graphics_scene", None)
-
-        # Check if image is validly loaded in scene
+        # Check if scene is real and has an image loaded
         scene_is_valid = (
             isinstance(scene, AnnotationScene)
             and hasattr(scene, "image_item")
             and scene.image_item
             and not scene.image_item.pixmap().isNull()
         )
-
         if not current_path or not scene_is_valid:
             QMessageBox.warning(self, "Error", "No valid image loaded to approve.")
             return
 
-        # Get annotations currently drawn on the scene
-        # MODIFICATION: get_all_annotations now only returns non-suggestions
+        # Get current annotations from the scene
         current_annotations_list = []
         try:
             if hasattr(scene, "get_all_annotations"):
-                # This method should return annotations in the required format (pixel coords)
                 current_annotations_list = scene.get_all_annotations()
-                logger.debug(
-                    f"Retrieved {len(current_annotations_list)} NON-SUGGESTION annotations from scene."
-                )
             else:
-                logger.error("Scene missing 'get_all_annotations' method.")
-                raise AttributeError("Missing get_all_annotations")
+                raise AttributeError("Scene missing 'get_all_annotations' method.")
         except Exception as e:
-            logger.exception("Failed to retrieve annotations from scene.")
+            logger.exception("Failed to retrieve annotations from scene")
             QMessageBox.warning(
-                self, "Approval Error", f"Could not retrieve annotations:\n{e}"
+                self, "Approval Error", f"Could not retrieve annotations: {e}"
             )
             return
 
-        # --- Store last box data for pasting ---
+        # Store data for the last non-suggestion box for pasting ('C' key)
         self.last_box_data = None
-        # Find ResizableRectItems currently in the scene THAT ARE NOT SUGGESTIONS
+        rect_item_class = ResizableRectItem
         rect_items = [
             item
             for item in scene.items()
-            if isinstance(item, ResizableRectItem) and not item.is_suggestion
+            if isinstance(item, rect_item_class) and not item.is_suggestion
         ]
         if rect_items:
-            # Store data from the last item added (or a specific selected one if desired)
-            last_item = rect_items[-1]  # Simple heuristic: last one drawn/added
+            # Get the last one added (usually the last one in the list)
+            last_item = rect_items[-1]
+            # Store its scene bounding rect and class label
             self.last_box_data = {
-                "rect": last_item.sceneBoundingRect(),  # Store scene coords
+                "rect": last_item.sceneBoundingRect(),  # Use scene rect directly
                 "class": getattr(last_item, "class_label", "Unknown"),
             }
             logger.debug(
-                f"Stored last box: Class='{self.last_box_data['class']}', SceneRect={self.last_box_data['rect']}"
+                f"Stored last box data: Class='{self.last_box_data['class']}', SceneRect={self.last_box_data['rect']}"
             )
         else:
             logger.debug(
-                "No NON-SUGGESTION annotation boxes on image, clearing last box data."
+                "No NON-SUGGESTION boxes found on scene, clearing last box data."
             )
-        # --- End store last box data ---
 
-        # Determine if image is marked as negative (no non-suggestion boxes)
+        # Determine if it's a negative image (no boxes drawn)
         is_negative_image = not current_annotations_list
 
         # Prepare data structure for state manager
-        annotation_data_to_save = {
-            "annotations_list": current_annotations_list,
-            "approved": True,  # Mark as approved
+        annotation_data = {
+            "annotations_list": current_annotations_list,  # Contains pixel coords from scene.get_all_annotations()
+            "approved": True,
             "negative": is_negative_image,
         }
 
         status_msg = f"Approving '{os.path.basename(current_path)}' ({'Negative' if is_negative_image else str(len(current_annotations_list)) + ' box(es)'})..."
         self.update_status(status_msg)
         logger.info(status_msg.replace("...", "."))
-        QCoreApplication.processEvents()  # Show status
+        QCoreApplication.processEvents()  # Update UI
 
-        # Send data to state manager
         try:
             logger.debug("Calling state.add_annotation...")
             if hasattr(self.state, "add_annotation"):
-                # State manager handles saving, updating counts, and triggering training
-                success = self.state.add_annotation(
-                    current_path, annotation_data_to_save
-                )
+                success = self.state.add_annotation(current_path, annotation_data)
                 if not success:
-                    # State manager indicated an issue saving
                     logger.error("state.add_annotation reported failure.")
                     QMessageBox.warning(
-                        self, "Approval Error", "Failed to save annotation data."
+                        self, "Approval Error", "Failed to save annotation state."
                     )
                     self.update_status("Approval failed.")
-                    return  # Don't navigate if save failed
+                    return
             else:
                 logger.error("State manager missing 'add_annotation' method.")
-                QMessageBox.critical(self, "Internal Error", "Cannot save annotation.")
+                QMessageBox.critical(
+                    self, "Internal Error", "Cannot save annotation state."
+                )
                 self.update_status("Approval failed.")
                 return
 
-            # Update UI count
+            # Update UI count and status
             self._update_annotated_count_label()
             self.update_status(
                 f"Approved: {os.path.basename(current_path)}. Navigating..."
             )
 
-            # Navigate after a short delay to allow UI updates
-            logger.debug("Scheduling navigation via QTimer.")
+            # Schedule navigation to next unannotated shortly after
+            logger.debug("Scheduling navigation to next unannotated via QTimer.")
             QTimer.singleShot(50, self.navigate_to_next_unannotated)
 
         except Exception as e:
-            logger.exception("Critical error during approval process.")
+            logger.exception("Critical error during approval process")
             QMessageBox.critical(
-                self, "Approval Error", f"Critical error during approval:\n{e}"
+                self,
+                "Approval Error",
+                f"A critical error occurred during approval:\n{e}",
             )
             self.update_status("Approval failed critically.")
 
     def navigate_to_next_unannotated(self):
-        """Finds and navigates to the next image that hasn't been approved."""
+        """Finds and navigates to the next unapproved image."""
         logger.info("Navigating to next unannotated image...")
         is_dummy_state = StateManager.__name__ == "_DummyStateManager"
         img_list = getattr(self.state, "image_list", []) if self.state else []
-
         if not self.state or is_dummy_state or not img_list:
-            logger.warning("Navigation aborted: Invalid state or empty list.")
+            logger.warning("Navigation aborted: Invalid state or empty image list.")
             self.update_status("Navigation failed: No images loaded.")
             return
 
@@ -2074,93 +1980,111 @@ class AnnotatorWindow(QMainWindow):
         start_index = getattr(self.state, "current_index", -1)
 
         if total_images == 0:
-            logger.warning("Navigation impossible: Image list empty.")
+            logger.warning("Navigation impossible: Image list is empty.")
             self.update_status("Image list empty.")
             return
 
-        # Start checking from the image *after* the current one, wrapping around
-        current_check_index = (start_index + 1) % total_images
+        # Start checking from the image *after* the current one
+        current_idx = (start_index + 1) % total_images
         checked_count = 0
-        found_unannotated = False
+        found = False
 
         while checked_count < total_images:
-            image_path_to_check = img_list[current_check_index]
-            # Check the 'approved' flag in the state manager's annotation data
-            is_approved = annotations_map.get(image_path_to_check, {}).get(
-                "approved", False
-            )
+            img_path = img_list[current_idx]
+            is_approved = annotations_map.get(img_path, {}).get("approved", False)
             logger.debug(
-                f"Nav Check: Idx {current_check_index} ('{os.path.basename(image_path_to_check)}'), Approved={is_approved}"
+                f"Nav Check: Index {current_idx} ('{os.path.basename(img_path)}'), Approved={is_approved}"
             )
 
             if not is_approved:
-                # Found an unannotated image
                 logger.info(
-                    f"Navigation found unannotated at Index {current_check_index}."
+                    f"Navigation found unannotated image at Index {current_idx}."
                 )
                 try:
-                    # Ask state manager to change index and load the image
                     if hasattr(self.state, "go_to_image") and self.state.go_to_image(
-                        current_check_index
+                        current_idx
                     ):
-                        self.load_image()
-                        found_unannotated = True
-                        break  # Stop searching
+                        self.load_image()  # Load the found image
+                        found = True
+                        break  # Exit loop once found and loaded
                     else:
-                        # state.go_to_image failed
                         logger.error(
-                            f"Navigation failed: state.go_to_image({current_check_index}) failed."
+                            f"Navigation failed: state.go_to_image({current_idx}) reported failure."
                         )
-                        self.update_status("Error loading next image (state error).")
-                        break  # Stop searching on error
+                        self.update_status(
+                            "Error loading next unannotated (state error)."
+                        )
+                        break
                 except Exception as e:
                     logger.exception(
-                        f"Navigation failed: Error loading image at index {current_check_index}."
+                        f"Navigation failed: Error loading image at index {current_idx}."
                     )
-                    self.update_status("Error loading next image.")
-                    break  # Stop searching on error
+                    self.update_status("Error loading next unannotated image.")
+                    break  # Exit loop on error
 
             # Move to the next index, wrapping around
-            current_check_index = (current_check_index + 1) % total_images
+            current_idx = (current_idx + 1) % total_images
             checked_count += 1
 
-        if not found_unannotated:
-            # Scanned all images, none were unannotated
+        if not found and checked_count >= total_images:
+            # If we checked all images and didn't find an unannotated one
             logger.info("Navigation complete: No unannotated images found.")
             self.update_status("All images appear to be annotated.")
 
     def clear_suggestion_boxes(self):
-        """Removes all suggestion boxes (items tracked in self.auto_box_items) from the scene."""
+        """Removes all suggestion boxes (items marked as is_suggestion=True)."""
         scene = getattr(self, "graphics_scene", None)
         if isinstance(scene, AnnotationScene):
-            # Find items stored in self.auto_box_items that are currently in the scene
+            # Find items in the scene that are suggestions
             items_to_remove = [
-                item for item in self.auto_box_items if item and item.scene() == scene
+                item
+                for item in scene.items()
+                if isinstance(item, ResizableRectItem) and item.is_suggestion
             ]
             if items_to_remove:
                 logger.debug(f"Clearing {len(items_to_remove)} suggestion boxes.")
                 for item in items_to_remove:
                     try:
                         scene.removeItem(item)
-                    except Exception as e:
-                        logger.error(f"Error removing suggestion item: {e}")
-        # Clear the list regardless
+                    except Exception:
+                        pass  # Ignore errors during removal
+        # Also clear our internal list reference
         self.auto_box_items = []
 
     def toggle_auto_boxes(self):
-        """Handles the 'Show Suggestions' checkbox state change."""
-        checkbox = getattr(self, "auto_box_button", None)
-        if not checkbox:
-            logger.error("Auto-box checkbox widget not found.")
+        """Handles 'Show Suggestions' checkbox state change (PRO ONLY)."""
+        # --- TIER CHECK ---
+        if self.current_tier != "PRO":
+            logger.warning("[BASIC] toggle_auto_boxes called unexpectedly.")
+            checkbox = getattr(self, "auto_box_button", None)
+            if checkbox:
+                checkbox.setChecked(False)  # Ensure it's off
+            self.clear_suggestion_boxes()
             return
+        # --- END TIER CHECK ---
 
-        # Check prerequisites for getting suggestions
+        checkbox = getattr(self, "auto_box_button", None)
+        conf_spinbox = getattr(self, "confidence_spinbox", None)
+        conf_layout = getattr(self, "conf_layout_widget", None)
+        if not checkbox:
+            return  # Should not happen
+
+        # Update enabled state of confidence controls based on checkbox
+        is_checked = checkbox.isChecked()
+        if conf_spinbox:
+            conf_spinbox.setEnabled(is_checked)
+        if conf_layout:
+            conf_layout.setEnabled(is_checked)
+
         is_dummy_state = StateManager.__name__ == "_DummyStateManager"
         state_ok = self.state and not is_dummy_state
+        # Check for REAL pipeline specifically
         pipeline_ok = (
             state_ok
             and hasattr(self.state, "training_pipeline")
             and bool(self.state.training_pipeline)
+            and TrainingPipeline.__name__
+            != "_DummyTrainingPipeline"  # Check class name
         )
         task_active = (
             state_ok
@@ -2168,30 +2092,32 @@ class AnnotatorWindow(QMainWindow):
             and self.state.is_task_active()
         )
 
-        # Disable checkbox if prerequisites not met
-        if not pipeline_ok:
-            if checkbox.isChecked():
-                self.update_status("Suggestions unavailable: ML Pipeline missing.")
-                checkbox.setChecked(False)  # Uncheck if user tried to check it
+        # Conditions under which suggestions cannot be shown
+        if is_checked and not pipeline_ok:
+            self.update_status(
+                "[PRO] Suggestions unavailable: ML Pipeline missing or dummy."
+            )
+            checkbox.setChecked(False)
             self.clear_suggestion_boxes()
-            return  # Ensure boxes are cleared
-        if task_active:
-            if checkbox.isChecked():
-                self.update_status("Suggestions unavailable: Task running.")
-                checkbox.setChecked(False)  # Uncheck
-            # Don't clear boxes here, might resume after task
+            return
+        if is_checked and task_active:
+            self.update_status(
+                "[PRO] Suggestions unavailable: Background task running."
+            )
+            # Don't uncheck here, maybe task finishes soon. User can uncheck manually.
+            # Keep existing suggestions hidden if checkbox is toggled off while task runs.
+            self.clear_suggestion_boxes()  # Clear existing ones if toggled off
             return
 
-        # Handle checkbox state
-        if checkbox.isChecked():
-            # --- Request suggestions ---
-            current_image_path = (
+        if is_checked:  # User wants suggestions ON
+            current_path = (
                 self.state.get_current_image()
                 if state_ok and hasattr(self.state, "get_current_image")
                 else None
             )
             scene = getattr(self, "graphics_scene", None)
-            scene_has_image = (
+            # Check if scene is real and has an image
+            scene_has_img = (
                 isinstance(scene, AnnotationScene)
                 and hasattr(scene, "image_item")
                 and scene.image_item
@@ -2199,80 +2125,88 @@ class AnnotatorWindow(QMainWindow):
             )
 
             if (
-                not current_image_path
-                or not os.path.exists(current_image_path)
-                or not scene_has_image
+                not current_path
+                or not os.path.exists(current_path)
+                or not scene_has_img
             ):
-                self.update_status("Cannot get suggestions: No valid image loaded.")
-                checkbox.setChecked(False)
+                self.update_status(
+                    "[PRO] Cannot get suggestions: No valid image loaded."
+                )
+                checkbox.setChecked(False)  # Turn off if no image
                 self.clear_suggestion_boxes()
                 return
 
-            # Clear old suggestions and request new ones
+            # Clear previous suggestions and request new ones
             self.clear_suggestion_boxes()
-            self.update_status("Requesting AI suggestions...")
-            QCoreApplication.processEvents()  # Show status update
+            self.update_status("[PRO] Requesting AI suggestions...")
+            QCoreApplication.processEvents()  # Update UI
             try:
                 if hasattr(self.state, "start_prediction"):
-                    # State manager starts the background prediction task
-                    success = self.state.start_prediction(current_image_path)
+                    # State manager handles confidence threshold internally now
+                    success = self.state.start_prediction(current_path)
                     if not success:
-                        # Task didn't start for some reason (e.g., another task conflict?)
-                        logger.warning(
-                            "state.start_prediction failed or task didn't start."
-                        )
-                        self.update_status("Failed to start suggestion task.")
-                        checkbox.setChecked(False)
+                        # State manager should emit error signal
+                        self.update_status("[PRO] Failed to start suggestion task.")
+                        checkbox.setChecked(False)  # Turn off on failure
                         self.clear_suggestion_boxes()
-                        # Ensure state manager resets blocking flag if needed
                 else:
-                    logger.error("State manager missing 'start_prediction' method.")
-                    self.update_status("Suggestion feature unavailable.")
+                    logger.error(
+                        "[PRO] State manager missing 'start_prediction' method."
+                    )
+                    self.update_status("[PRO] Suggestion feature unavailable.")
                     checkbox.setChecked(False)
             except Exception as e:
-                logger.exception("Critical error starting prediction task.")
+                logger.exception("[PRO] Critical error starting prediction task.")
                 QMessageBox.critical(
                     self,
                     "Suggestion Error",
-                    f"Critical error starting suggestion task:\n{e}",
+                    f"Critical error requesting suggestions:\n{e}",
                 )
-                self.update_status("Suggestion task failed critically.")
+                self.update_status("[PRO] Suggestion task failed critically.")
                 checkbox.setChecked(False)
                 self.clear_suggestion_boxes()
-                # Attempt to reset blocking state if possible on critical failure
+                # Try to reset task running state if exception occurred here
                 if hasattr(self.state, "_blocking_task_running"):
                     try:
                         self.state._blocking_task_running = False
-                    except:
+                    except Exception:
                         pass
-                self.on_ml_task_running_changed(False)  # Manually update UI state
-        else:
-            # --- Hide suggestions ---
+                self.on_ml_task_running_changed(False)  # Force UI update
+
+        else:  # User wants suggestions OFF
             self.clear_suggestion_boxes()
-            self.update_status("Suggestions hidden.")
+            self.update_status("[PRO] Suggestions hidden.")
 
     @pyqtSlot(bool)
     def on_ml_task_running_changed(self, is_blocking_task_running: bool):
-        """Updates UI element enabled states based on whether a background task is running."""
-        self._ml_task_active = is_blocking_task_running
-        logger.info(f"UI Update: Blocking Task Active = {is_blocking_task_running}.")
+        """Updates UI element enabled states based on task status and tier."""
+        self._ml_task_active = is_blocking_task_running  # Store state
+        logger.info(
+            f"UI Update: Blocking Task Active = {is_blocking_task_running}. Tier = {self.current_tier}."
+        )
 
+        is_pro_tier = self.current_tier == "PRO"
         is_dummy_state = StateManager.__name__ == "_DummyStateManager"
-        # Check if a real pipeline instance exists
-        pipeline_exists = (
+        # Check for REAL pipeline specifically
+        pipeline_exists_and_real = (
             self.state
             and not is_dummy_state
             and hasattr(self.state, "training_pipeline")
             and bool(self.state.training_pipeline)
+            and TrainingPipeline.__name__
+            != "_DummyTrainingPipeline"  # Check class name
         )
 
-        # General controls should be disabled during blocking tasks
+        # General controls are disabled if *any* task is running
         enable_general_controls = not is_blocking_task_running
-        # ML-specific controls require pipeline AND no blocking task
-        enable_ml_controls = pipeline_exists and not is_blocking_task_running
 
-        # List widgets affected by general blocking state
-        general_widgets = [
+        # ML controls require Pro tier, a real pipeline, AND no task running
+        enable_ml_controls = (
+            is_pro_tier and pipeline_exists_and_real and not is_blocking_task_running
+        )
+
+        # --- Update Basic Controls ---
+        basic_widgets = [
             "load_button",
             "load_session_button",
             "save_session_button",
@@ -2285,269 +2219,274 @@ class AnnotatorWindow(QMainWindow):
             "load_sess_action",
             "save_sess_action",
             "settings_action",
-            "export_model_action",
-            "export_data_action",
+            "export_data_action",  # Export data is basic
+        ]
+        for name in basic_widgets:
+            self.set_enabled_safe(name, enable_general_controls)
+
+        # --- Update Pro Controls ---
+        # These depend on the combined 'enable_ml_controls' flag
+        pro_widgets = [
+            # "auto_box_button", # Enabled state handled by toggle_auto_boxes
+            # "confidence_spinbox", # Enabled state handled by toggle_auto_boxes
             "force_mini_train_button",
             "training_dashboard_button",
         ]
-        for widget_name in general_widgets:
-            self.set_enabled_safe(widget_name, enable_general_controls)
+        for name in pro_widgets:
+            self.set_enabled_safe(name, enable_ml_controls)
 
-        # List widgets specifically requiring the ML pipeline
-        ml_widgets = ["auto_box_button", "confidence_spinbox"]
-        for widget_name in ml_widgets:
-            self.set_enabled_safe(widget_name, enable_ml_controls)
+        # Handle Pro menu actions
+        export_model_act = getattr(self, "export_model_action", None)
+        if export_model_act:
+            export_model_act.setEnabled(enable_ml_controls)
 
-        # Special handling for confidence spinbox (depends on checkbox state too)
-        conf_spin = getattr(self, "confidence_spinbox", None)
-        sugg_check = getattr(self, "auto_box_button", None)
-        if conf_spin and sugg_check:
-            conf_spin.setEnabled(enable_ml_controls and sugg_check.isChecked())
+        # Special handling for auto-annotation group based on checkbox state *and* ML availability
+        auto_box_btn = getattr(self, "auto_box_button", None)
+        conf_spinbox = getattr(self, "confidence_spinbox", None)
+        conf_layout_widget = getattr(self, "conf_layout_widget", None)
+        auto_group_widget = getattr(self, "auto_group", None)
 
-        # Update status bar if task just finished
+        # Auto-box checkbox itself should be enabled based on ML controls availability
+        self.set_enabled_safe("auto_box_button", enable_ml_controls)
+
+        # Confidence controls enabled only if ML is available AND checkbox is checked
+        is_conf_enabled = (
+            enable_ml_controls and auto_box_btn and auto_box_btn.isChecked()
+        )
+        if conf_spinbox:
+            conf_spinbox.setEnabled(is_conf_enabled)
+        if conf_layout_widget:
+            conf_layout_widget.setEnabled(is_conf_enabled)
+        # The group box itself can just follow the checkbox enable state
+        # if auto_group_widget: auto_group_widget.setEnabled(enable_ml_controls) # Or keep enabled and just disable contents?
+
+        # If task just finished, update status unless already set
         if not is_blocking_task_running:
             current_status = getattr(self.status_label, "text", lambda: "")()
             lower_status = current_status.lower()
-            # Check if status indicates a completed action or error state
-            is_final_state = any(
-                k in lower_status
-                for k in [
-                    "complete",
-                    "error",
-                    "fail",
-                    "loaded",
-                    "saved",
-                    "ready",
-                    "found",
-                    "cancelled",
-                    "exported",
-                    "finished",
-                    "approved",
-                    "unavailable",
-                    "unchanged",
-                ]
-            )
-            # If status doesn't reflect completion, reset to "Ready."
-            if not is_final_state:
+            # Check if status indicates a final state
+            final_keys = [
+                "complete",
+                "error",
+                "fail",
+                "loaded",
+                "saved",
+                "ready",
+                "found",
+                "cancelled",
+                "exported",
+                "finished",
+                "approved",
+                "unavailable",
+                "unchanged",
+            ]
+            is_final = any(k in lower_status for k in final_keys)
+            if not is_final:
                 self.update_status("Ready.")
 
     @pyqtSlot(list)
     def handle_prediction_results(self, boxes: list):
-        """Displays bounding box suggestions received from the prediction worker."""
-        # MODIFIED: Logic to create ResizableRectItem with is_suggestion=True
-        logger.info(f"GUI: Received {len(boxes)} prediction results.")
-        self.clear_suggestion_boxes()  # Clear any previous suggestions
+        """Displays bounding box suggestions (PRO ONLY)."""
+        # --- TIER CHECK ---
+        if self.current_tier != "PRO":
+            logger.warning("[BASIC] Received prediction results unexpectedly.")
+            return
+        # --- END TIER CHECK ---
 
-        # --- Validation ---
+        logger.info(f"GUI: Received {len(boxes)} prediction results.")
+        self.clear_suggestion_boxes()  # Clear any old ones first
+
         is_dummy_state = StateManager.__name__ == "_DummyStateManager"
         scene = getattr(self, "graphics_scene", None)
+        # Check if scene is real and has image
         scene_ok = (
             isinstance(scene, AnnotationScene)
             and hasattr(scene, "image_item")
             and scene.image_item
             and not scene.image_item.pixmap().isNull()
         )
-        # Use the potentially modified ResizableRectItem class from gui
+        # Check if ResizableRectItem is real
         rect_item_class = ResizableRectItem
         rect_item_ok = rect_item_class.__name__ != "DummyResizableRectItem"
         auto_box_checkbox = getattr(self, "auto_box_button", None)
 
+        # Conditions where we cannot display suggestions
         if is_dummy_state or not scene_ok or not rect_item_ok:
             logger.warning(
-                f"Cannot display suggestions: Invalid state/scene/item (StateDummy:{is_dummy_state}, SceneOK:{scene_ok}, ItemOK:{rect_item_ok})."
+                f"Cannot display suggestions: Invalid state/scene/item (Dummy:{is_dummy_state}, SceneOK:{scene_ok}, ItemOK:{rect_item_ok})."
             )
             if auto_box_checkbox:
-                auto_box_checkbox.setChecked(False)  # Uncheck if failed
-            self.update_status("Error displaying suggestions (internal).")
+                auto_box_checkbox.setChecked(False)  # Turn off checkbox
+            self.update_status("Error displaying suggestions (internal error).")
             return
 
+        # Get image dimensions for coordinate mapping
         img_width, img_height = (
             scene.get_image_size() if hasattr(scene, "get_image_size") else (0, 0)
         )
         if img_width <= 0 or img_height <= 0:
-            logger.error(
-                "Cannot display suggestions: Invalid image dimensions retrieved from scene."
-            )
-            self.update_status("Error processing suggestions (img size).")
-            if auto_box_checkbox:
-                auto_box_checkbox.setChecked(False)
+            logger.error("Cannot display suggestions: Invalid image dimensions.")
+            self.update_status("Error processing suggestions.")
             return
-        # --- End Validation ---
 
         items_added_count = 0
-
-        img_item = scene.image_item  # Cache for performance
-
+        img_item = scene.image_item  # Reference image item for mapping
         for box_data in boxes:
             try:
-                # Extract data safely
-                pixel_coords = box_data.get("box")
+                # Extract data (pixel coordinates expected from state manager)
+                pixel_coords = box_data.get("box")  # Should be [x, y, w, h] in pixels
                 confidence = box_data.get("confidence", 0.0)
                 class_label = box_data.get("class", "Unknown")
 
-                # Validate coordinates
                 if (
                     not isinstance(pixel_coords, (list, tuple))
                     or len(pixel_coords) != 4
                 ):
                     logger.warning(
-                        f"Skipping suggestion with invalid 'box' format: {pixel_coords}"
+                        f"Skipping suggestion with invalid box data: {box_data}"
                     )
                     continue
                 px, py, pw, ph = map(float, pixel_coords)
                 if pw <= 0 or ph <= 0:
                     logger.warning(
-                        f"Skipping suggestion with zero/negative dimensions: W={pw}, H={ph}"
+                        f"Skipping suggestion with non-positive size: w={pw}, h={ph}"
                     )
                     continue
 
-                # Convert pixel coordinates (relative to image) to scene coordinates
-                if not img_item:
-                    continue  # Should not happen if scene_ok check passed
+                # Convert pixel QRectF to scene QRectF
                 pixel_rect = QRectF(px, py, pw, ph)
                 scene_rect = img_item.mapRectToScene(pixel_rect)
 
-                # MODIFICATION: Instantiate ResizableRectItem as a suggestion
+                # Create suggestion item
                 suggestion_item = rect_item_class(
-                    scene_rect,
-                    class_label,  # Pass the base class label
-                    is_suggestion=True,  # Set the suggestion flag
-                    confidence=confidence,  # Pass the confidence score
+                    scene_rect, class_label, is_suggestion=True, confidence=confidence
                 )
-
-                # Set Z-value (optional, controls stacking order)
-                suggestion_item.setZValue(5)
-
+                suggestion_item.setZValue(
+                    5
+                )  # Ensure suggestions are slightly above image but below user boxes
                 scene.addItem(suggestion_item)
-                self.auto_box_items.append(suggestion_item)  # Keep track for clearing
+                self.auto_box_items.append(suggestion_item)  # Keep track
                 items_added_count += 1
-
-            except (ValueError, TypeError, KeyError) as e:
-                logger.error(f"Invalid data processing suggestion {box_data}: {e}")
             except Exception as e:
                 logger.error(
-                    f"Error creating suggestion item {box_data}: {e}", exc_info=True
+                    f"Error creating suggestion item from data {box_data}: {e}",
+                    exc_info=True,
                 )
 
-        # Update status
         status_msg = f"Displayed {items_added_count} suggestion(s)."
-        if items_added_count != len(boxes):
-            status_msg += f" (Filtered from {len(boxes)})"
         self.update_status(status_msg)
         logger.info(status_msg)
 
     @pyqtSlot(str)
     def handle_training_run_completed(self, run_dir_path: str):
-        """Handles the signal emitted when a training run finishes successfully."""
+        """Handles successful training run signal (PRO ONLY)."""
+        # --- TIER CHECK ---
+        if self.current_tier != "PRO":
+            logger.warning("[BASIC] Received training completion signal unexpectedly.")
+            return
+        # --- END TIER CHECK ---
+
         run_name = (
             os.path.basename(run_dir_path)
             if run_dir_path and os.path.isdir(run_dir_path)
             else "Unknown Run"
         )
-        logger.info(f"GUI: Received training completion signal for run: {run_name}")
-        self.update_status(f"Training '{run_name}' finished successfully.")
+        logger.info(
+            f"[PRO] GUI: Received training completion signal for run: {run_name}"
+        )
+        self.update_status(f"Training run '{run_name}' finished successfully.")
 
-        # --- Update the Training Dashboard if it's open ---
+        # Update the dashboard if it's open
         if self.training_dashboard_instance and hasattr(
             self.training_dashboard_instance, "update_graph"
         ):
             logger.info(
-                f"Updating open training dashboard with data from run directory: {run_dir_path}"
+                f"[PRO] Updating open training dashboard with data from: {run_dir_path}"
             )
-            # --- FIX: Pass the run directory path directly ---
             self.training_dashboard_instance.update_graph(run_dir_path)
         else:
-            if not self.training_dashboard_instance:
-                logger.info("Training dashboard not open, graph update skipped.")
-            else:
-                logger.error("Training dashboard instance lacks 'update_graph' method.")
-        # --- End Dashboard Update ---
+            logger.info(
+                "[PRO] Training dashboard not open or invalid, graph update skipped."
+            )
 
     @pyqtSlot(str)
     def handle_task_error(self, error_message: str):
         """Handles error signals from background workers."""
-        # Try to determine task type from message for better context
-        task_type = "ML Task"
+        task_type = "ML Task"  # Generic default
         lower_msg = str(error_message).lower() if error_message else ""
+
+        # Determine task type from message content
         if (
             "prediction" in lower_msg
             or "suggest" in lower_msg
             or "auto_box" in lower_msg
         ):
             task_type = "Prediction"
-            # If prediction failed, uncheck the suggestion box
-            if hasattr(self, "auto_box_button"):
-                auto_box_checkbox = getattr(self, "auto_box_button")
-                if auto_box_checkbox and auto_box_checkbox.isChecked():
-                    auto_box_checkbox.setChecked(False)  # Keep UI consistent
+            # If prediction failed, turn off suggestions checkbox
+            if self.current_tier == "PRO":
+                checkbox = getattr(self, "auto_box_button", None)
+                if checkbox and checkbox.isChecked():
+                    checkbox.setChecked(False)
             self.clear_suggestion_boxes()  # Clear any partial suggestions
         elif "train" in lower_msg:
-            # Try to be more specific about training errors if possible
-            if "training failed:" in lower_msg:
-                task_type = "Training Run"
-            elif "training setup" in lower_msg:
-                task_type = "Training Setup"
-            else:
-                task_type = "Training"
+            task_type = "Training"
 
         logger.error(f"GUI Received Error Signal ({task_type}): {error_message}")
-
-        # Display error message to user (limit length for readability)
+        # Truncate long messages for display
         display_message = str(error_message)[:500] + (
             "..." if len(str(error_message)) > 500 else ""
         )
         QMessageBox.warning(
             self,
             f"{task_type} Error",
-            f"Background task error:\n\n{display_message}\n\n(Check app_debug.log for details)",
+            f"A background task encountered an error:\n\n{display_message}\n\n(Check app_debug.log for details)",
         )
-        self.update_status(f"{task_type} Error.")  # Update status bar
+        self.update_status(f"{task_type} Error.")
+        # Ensure UI is re-enabled (task_running should have been set to False by state manager)
+        # self.on_ml_task_running_changed(False) # Redundant if state manager emits task_running(False) on error
 
     def closeEvent(self, event):
-        """Handles the window close event, checks for running tasks and save prompts."""
-        is_blocking_task_active = False
-        if self.state and hasattr(self.state, "is_task_active"):
-            is_blocking_task_active = self.state.is_task_active()
-
+        """Handles window close, checks tasks, prompts save."""
         # Check if a task is running
-        if is_blocking_task_active:
-            task_desc = "A background task (Training/Prediction)"
+        is_blocking = (
+            self.state.is_task_active()
+            if self.state and hasattr(self.state, "is_task_active")
+            else False
+        )
+
+        if is_blocking:
             reply = QMessageBox.warning(
                 self,
                 "Task Running",
-                f"{task_desc} is running.\nClosing might interrupt it.\n\nWait or Close Anyway?",
+                "A background task is still running.\nClosing now might interrupt it and lead to incomplete results or corrupted files.\n\nWait for the task to finish or Close Anyway?",
                 QMessageBox.StandardButton.Wait | QMessageBox.StandardButton.Close,
-                QMessageBox.StandardButton.Wait,  # Default to Wait
+                QMessageBox.StandardButton.Wait,
             )
             if reply == QMessageBox.StandardButton.Close:
                 logger.warning(
-                    "User closing window while task running. Attempting cleanup..."
+                    "User chose to close while task running. Attempting cleanup..."
                 )
-                # Attempt to trigger state manager cleanup (which should try to stop worker)
                 if self.state and hasattr(self.state, "cleanup"):
                     try:
-                        self.state.cleanup()
-                    except Exception as cleanup_err:
-                        logger.error(
-                            f"Error during StateManager cleanup on forced exit: {cleanup_err}"
-                        )
-                event.accept()
-                return  # Accept close event
+                        self.state.cleanup()  # Attempt graceful shutdown
+                    except Exception:
+                        pass
+                event.accept()  # Allow close
+                return
             else:
-                # User chose Wait
-                event.ignore()  # Ignore close event
-                self.update_status("Waiting for background task...")
+                event.ignore()  # Don't close
+                self.update_status("Waiting for background task to complete...")
                 return
 
-        # Ask to save if not using dummy state and data exists
-        save_reply = QMessageBox.StandardButton.No  # Default if no prompt needed
+        # Prompt to save session if data exists and not using dummy
+        save_reply = QMessageBox.StandardButton.No
         is_dummy_state = StateManager.__name__ == "_DummyStateManager"
         if self.state and not is_dummy_state:
-            # Prompt if there are images loaded OR annotations exist
-            needs_save_prompt = (
+            # Check if there's anything worth saving
+            needs_save = (
                 hasattr(self.state, "image_list") and self.state.image_list
             ) or (hasattr(self.state, "annotations") and self.state.annotations)
-            if needs_save_prompt:
+            if needs_save:
                 save_reply = QMessageBox.question(
                     self,
                     "Exit Confirmation",
@@ -2555,22 +2494,21 @@ class AnnotatorWindow(QMainWindow):
                     QMessageBox.StandardButton.Yes
                     | QMessageBox.StandardButton.No
                     | QMessageBox.StandardButton.Cancel,
-                    QMessageBox.StandardButton.Yes,  # Default to Yes
+                    QMessageBox.StandardButton.Yes,
                 )
             else:
-                # No data loaded, no need to save
-                save_reply = QMessageBox.StandardButton.No
+                save_reply = QMessageBox.StandardButton.No  # Nothing to save
 
-        # Handle user response to save prompt
         if save_reply == QMessageBox.StandardButton.Cancel:
             event.ignore()
-            logger.info("Window close cancelled by user.")
+            logger.info("Close cancelled by user.")
             return
         elif save_reply == QMessageBox.StandardButton.Yes:
             try:
                 self.update_status("Saving session before exit...")
                 QCoreApplication.processEvents()
-                self.save_session()
+                self.save_session()  # Call the save method
+                # Check status bar to see if save failed (though save_session should handle errors)
                 current_status = getattr(self.status_label, "text", lambda: "")()
                 if (
                     "error" not in current_status.lower()
@@ -2579,30 +2517,82 @@ class AnnotatorWindow(QMainWindow):
                     self.update_status("Session saved. Exiting.")
                 QCoreApplication.processEvents()
             except Exception as save_e:
-                logger.error("Failed to save session during exit.", exc_info=True)
-                # Inform user but still exit
+                logger.error("Failed to save session on exit.", exc_info=True)
                 QMessageBox.critical(
                     self,
                     "Save Error",
                     f"Failed to save session on exit:\n{save_e}\n\nExiting without saving.",
                 )
-        else:
+                # Continue exiting even if save fails
+        else:  # No or Don't Save
             self.update_status("Exiting without saving...")
             QCoreApplication.processEvents()
 
-        # Perform final cleanup (only if not forcing close during task)
-        if not is_blocking_task_active:
+        # Final cleanup if no task was running initially
+        if not is_blocking:
             if self.state and hasattr(self.state, "cleanup"):
                 try:
                     logger.info("Calling final StateManager cleanup...")
                     self.state.cleanup()
-                    logger.info("StateManager cleanup completed.")
-                except Exception as e:
+                except Exception:
                     logger.exception("Error during final StateManager cleanup.")
 
         logger.info("Accepting close event. Application exiting.")
-        event.accept()
+        event.accept()  # Allow close
 
+    # --- Add Manage Classes Method ---
+    def manage_classes(self):
+        """Opens a dialog to manage annotation classes (Basic & Pro)."""
+        if (
+            not self.state
+            or not hasattr(self.state, "class_list")
+            or not hasattr(self.state, "update_classes")
+        ):
+            QMessageBox.warning(
+                self, "Error", "Class management unavailable (State Manager error)."
+            )
+            return
 
-# --- Main block removed --- (Should be in main.py)
-# --- End of Part 2 ---
+        current_classes = self.state.class_list
+        # Simple dialog for now, could be more complex later
+        classes_text, ok = QInputDialog.getMultiLineText(
+            self,
+            "Manage Classes",
+            "Enter class names (one per line):",
+            "\n".join(current_classes),
+        )
+
+        if ok:
+            new_classes_raw = [line.strip() for line in classes_text.splitlines()]
+            new_classes_clean = sorted(
+                list(set(c for c in new_classes_raw if c))
+            )  # Remove empty and duplicates, sort
+
+            if new_classes_clean != current_classes:
+                reply = QMessageBox.question(
+                    self,
+                    "Confirm Class Update",
+                    f"Update classes to:\n{', '.join(new_classes_clean) or '(None)'}\n\n"
+                    f"WARNING: Annotations using removed classes will be deleted.\nContinue?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                    QMessageBox.StandardButton.Cancel,
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    try:
+                        self.update_status("Updating class list...")
+                        self.state.update_classes(new_classes_clean)
+                        self.update_status("Class list updated.")
+                        # Reload current image to reflect potential annotation changes
+                        self.load_image()
+                    except Exception as e:
+                        logger.error(f"Error updating classes: {e}", exc_info=True)
+                        QMessageBox.critical(
+                            self, "Error", f"Failed to update classes:\n{e}"
+                        )
+                        self.update_status("Error updating classes.")
+                else:
+                    self.update_status("Class update cancelled.")
+            else:
+                self.update_status("Class list unchanged.")
+        else:
+            self.update_status("Class management cancelled.")
