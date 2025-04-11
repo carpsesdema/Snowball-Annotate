@@ -1,0 +1,31 @@
+# .gitignore for Snowball Annotation project
+
+# Node modules (auto-generated dependencies)
+node_modules/
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE configuration files
+.idea/
+*.iml
+.vscode/
+
+# System files and temporary files
+.DS_Store
+Thumbs.db
+*.swp
+
+# Log files
+*.log
+
+# Virtual environment directories (if applicable)
+venv/
+env/
+
+# Build artifacts and temporary export directories
+build/
+dist/
+tmp/
