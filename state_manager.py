@@ -1,4 +1,3 @@
-# state_manager.py (Tiering Added & Formatted)
 
 import os
 import json
@@ -186,9 +185,9 @@ class StateManager(QObject):
         self.annotations = {}
         self._settings = {}
         self._user_settings_path = config.DEFAULT_SETTINGS_PATH
-        self.load_settings()
+        self.load_settings()  # Load settings first
 
-        os.makedirs(os.path.dirname(self._user_settings_path), exist_ok=True)
+        # Determine session path based on loaded settings
         session_path_key = config.SETTING_KEYS.get("session_path", "paths.session_path")
         session_dir = os.path.dirname(
             self.get_setting(session_path_key, config.DEFAULT_SESSION_PATH)
@@ -228,15 +227,21 @@ class StateManager(QObject):
             logger_sm.exception("FATAL: Failed TrainingPipeline init.")
             self.training_pipeline = None  # Ensure it's None on failure
 
-        # Apply loaded settings to pipeline etc.
+        # --- MOVED TIER ASSIGNMENT HERE ---
+        # Set the instance's tier based on the global config value (set by main.py)
+        self.current_tier = getattr(config, "TIER", "UNKNOWN")
+        logger_sm.info(f"StateManager instance tier set to: {self.current_tier}")
+        # -----------------------------------
+
+        # Apply loaded settings to pipeline etc. NOW that self.current_tier exists
         self.update_internal_from_settings()
 
+        # Initialize worker/thread attributes
         self._current_thread = None
         self._current_worker = None
         self._blocking_task_running = False
 
-        # --- TIERING: Use current_tier attribute ---
-        self.current_tier = getattr(config, "TIER", "UNKNOWN")
+        # Final log message confirming initialization
         logger_sm.info(
             f"StateManager initialized for Tier: {self.current_tier}. "
             f"Save path: {self.session_path}"
@@ -329,6 +334,14 @@ class StateManager(QObject):
 
     def update_internal_from_settings(self, changed_key=None):
         """Updates internal state (like session path, pipeline settings) from settings dict."""
+        # --- IMPORTANT: Check if self.current_tier exists before using it ---
+        if not hasattr(self, 'current_tier'):
+             logger_sm.error("CRITICAL: update_internal_from_settings called before self.current_tier was set!")
+             # You might want to force set it here as a fallback, though the __init__ order should prevent this now.
+             # self.current_tier = getattr(config, "TIER", "UNKNOWN")
+             # logger_sm.warning(f"Force-set current_tier to {self.current_tier} in update_internal")
+             return # Or raise an error? Better to return and rely on correct init order.
+
         logger_sm.debug(
             f"Updating internal state from settings (changed: {changed_key})."
         )
@@ -365,7 +378,7 @@ class StateManager(QObject):
         )
 
         if (
-            self.current_tier == "PRO"
+            self.current_tier == "PRO" # Now safe to access self.current_tier
             and is_real_pipeline
             and (changed_key is None or changed_key in pipeline_relevant_keys)
         ):
